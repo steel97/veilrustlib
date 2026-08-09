@@ -89,6 +89,7 @@ pub mod buffer_reader;
 pub mod crypto;
 pub mod ct_utils;
 pub mod error;
+pub mod hdwallet;
 pub mod range_proof_params;
 pub mod scanner;
 pub mod serialization;
@@ -112,6 +113,10 @@ pub use types::{
 };
 
 pub use buffer_reader::BufferReader;
+pub use hdwallet::{
+    derive_stealth_keys, derive_stealth_keys_from_seed, mnemonic_to_seed, AccountType, ExtendedKey,
+    HdAccount, HdWallet, StealthKeys, BIP44_PURPOSE, VEIL_BIP44_ID, VEIL_RINGCT_ACCOUNT,
+};
 pub use stealth::{
     create_wallet, decode_stealth_address, generate_ephemeral_keys, generate_stealth_address,
     is_valid_address, restore_wallet, validate_address, VeilWallet,

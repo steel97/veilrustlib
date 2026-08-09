@@ -107,11 +107,19 @@ fn negate_scalar(value: &[u8; 32]) -> [u8; 32] {
 // Key generation
 // ============================================================================
 
+/// Whether a scalar is a usable secret key, i.e. in `[1, n)`.
+///
+/// BIP32 derivation needs this check: a tweak at or above the group order, or
+/// equal to zero, means the caller must skip to the next child index.
+pub fn is_secret_key_in_range(key: &SecretKey) -> bool {
+    key.iter().any(|&b| b != 0) && *key < CURVE_ORDER
+}
+
 /// Generate a uniformly random, in-range secret key.
 pub fn generate_private_key() -> SecretKey {
     loop {
         let key = crate::utils::random_32();
-        if !key.iter().all(|&b| b == 0) && key < CURVE_ORDER {
+        if is_secret_key_in_range(&key) {
             return key;
         }
     }

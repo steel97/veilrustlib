@@ -1,0 +1,16 @@
+[package]
+name = "veilrustlib-examples"
+description = "Runnable examples for veilrustlib, ported from the TypeScript wrapper's examples/"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+veilrustlib = { path = "../veilrustlib", features = ["rpc"] }
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
+
+[[bin]]
+name = "get-balance"
+path = "src/bin/get_balance.rs"

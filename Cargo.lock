@@ -1377,6 +1377,7 @@ version = "1.3.1"
 dependencies = [
  "base64",
  "hex",
+ "hmac",
  "rand 0.8.7",
  "reqwest",
  "ripemd",
@@ -1386,6 +1387,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "veil-crypto",
+]
+
+[[package]]
+name = "veilrustlib-examples"
+version = "1.3.1"
+dependencies = [
+ "tokio",
+ "veilrustlib",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/veilrustlib"]
+members = ["crates/examples", "crates/veilrustlib"]
 resolver = "2"
 
 [workspace.package]

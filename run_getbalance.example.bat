@@ -1,0 +1,1 @@
+cargo run -p veilrustlib-examples --bin get-balance 2> $null
