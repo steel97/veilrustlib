@@ -139,13 +139,21 @@ async fn run() -> Result<(), VeilError> {
     // will report no transactions and the balance will read as zero.
     if std::env::var("VEIL_IMPORT_ADDRESS").as_deref() == Ok("1") {
         println!("   VEIL_IMPORT_ADDRESS=1, registering the address for watch-only scanning...");
-        client
+        let res = client
             .import_lightwallet_address(
                 &bytes_to_hex(&keys.scan_secret),
                 &bytes_to_hex(&keys.spend_pubkey),
                 0,
             )
-            .await?;
+            .await;
+
+        match res {
+            Err(err) => {
+                println!("error: {}", err);
+            }
+            _ => {}
+        }
+
         println!("   Registered. The node may need time to finish scanning.\n");
     }
 

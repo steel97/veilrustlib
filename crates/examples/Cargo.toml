@@ -9,8 +9,12 @@ repository.workspace = true
 
 [dependencies]
 veilrustlib = { path = "../veilrustlib", features = ["rpc"] }
-tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "time"] }
 
 [[bin]]
 name = "get-balance"
 path = "src/bin/get_balance.rs"
+
+[[bin]]
+name = "tx"
+path = "src/bin/tx.rs"
