@@ -18,10 +18,14 @@ use crate::serialization::{
     calculate_txid, encode_anon_prevout_hash, encode_leb128, serialize_output_data,
     serialize_transaction, serialize_transaction_bytes,
 };
-use crate::stealth::{generate_ephemeral_keys, generate_stealth_address};
+use crate::basecoin::{decode_basecoin_address, BasecoinAddress};
+use crate::stealth::{
+    decode_stealth_address, generate_ephemeral_keys, generate_stealth_address,
+    DecodedStealthAddress,
+};
 use crate::types::{
-    AnonOutput, Blind, Commitment, DataOutputType, OutPoint, PublicKey, ScriptStack, SecretKey,
-    Transaction, TransactionType, TxOutput, Utxo, ANON_MARKER,
+    AnonOutput, Blind, Commitment, DataOutputType, OutPoint, OutputType, PublicKey, ScriptStack,
+    SecretKey, Transaction, TransactionType, TxOutput, Utxo, ANON_MARKER,
 };
 use crate::utils::{is_valid_amount, is_valid_ring_size, random_32, random_sample, satoshis_to_veil};
 
@@ -65,9 +69,20 @@ impl Default for TransactionBuilderConfig {
 }
 
 /// A payment destination.
+///
+/// The address decides how the output is paid, and the two forms differ in what
+/// they reveal:
+///
+/// - an `sv1...` stealth address becomes a blinded [`TxOutput::RingCt`] output,
+///   hiding both the amount and the recipient
+/// - a `V...` or `bv1...` basecoin address becomes a transparent
+///   [`TxOutput::Standard`] output, where the amount and destination are public
+///
+/// Use [`Recipient::destination`] to see which applies before building.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recipient {
-    /// Destination stealth address.
+    /// Destination address, either stealth (`sv1...`) or basecoin
+    /// (`V...`/`bv1...`).
     pub address: String,
     /// Amount in satoshis.
     pub amount: u64,
@@ -79,6 +94,86 @@ impl Recipient {
         Self {
             address: address.into(),
             amount,
+        }
+    }
+
+    /// Classify this recipient's address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VeilError::InvalidAddress`] when the address is neither a valid
+    /// stealth address nor a valid basecoin address.
+    pub fn destination(&self) -> Result<Destination> {
+        classify_address(&self.address)
+    }
+
+    /// Whether this recipient is paid as a transparent output.
+    ///
+    /// A transparent output publishes its amount, so a caller that requires
+    /// privacy should check this before broadcasting.
+    pub fn is_transparent(&self) -> bool {
+        matches!(self.destination(), Ok(Destination::Basecoin(_)))
+    }
+}
+
+/// What kind of output an address is paid with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// A stealth address, paid as a blinded RingCT output.
+    Stealth(Box<DecodedStealthAddress>),
+    /// A transparent address, paid as a standard output.
+    Basecoin(BasecoinAddress),
+}
+
+impl Destination {
+    /// The output type this destination produces.
+    pub fn output_type(&self) -> OutputType {
+        match self {
+            Self::Stealth(_) => OutputType::RingCt,
+            Self::Basecoin(_) => OutputType::Standard,
+        }
+    }
+
+    /// Whether paying this destination reveals the amount on chain.
+    pub fn is_transparent(&self) -> bool {
+        matches!(self, Self::Basecoin(_))
+    }
+}
+
+/// Classify an address as stealth or basecoin.
+///
+/// Stealth is tried first, since it is the private form and the one the builder
+/// prefers; a `V...` or `bv1...` address then falls through to basecoin. This
+/// mirrors `CVeilAddress.parse` in the Dart reference, which likewise treats the
+/// two families as mutually exclusive.
+///
+/// # Errors
+///
+/// Returns [`VeilError::InvalidAddress`] when neither decode succeeds. The
+/// message reports the basecoin failure, since an address that is neither is
+/// most often a mistyped transparent address.
+pub fn classify_address(address: &str) -> Result<Destination> {
+    let trimmed = address.trim();
+
+    if trimmed.to_ascii_lowercase().starts_with("sv1") {
+        return decode_stealth_address(trimmed).map(|decoded| Destination::Stealth(Box::new(decoded)));
+    }
+
+    match decode_basecoin_address(trimmed) {
+        Ok(basecoin) => Ok(Destination::Basecoin(basecoin)),
+        Err(basecoin_error) => {
+            // Report the underlying reason without repeating the wrapper's own
+            // prefix, which would otherwise nest as
+            // "invalid address: ... invalid address: ...".
+            let reason = match &basecoin_error {
+                VeilError::InvalidAddress(reason) => reason.clone(),
+                other => other.to_string(),
+            };
+
+            Err(VeilError::InvalidAddress(format!(
+                "{trimmed:?} is neither a stealth (sv1...) nor a basecoin \
+                 (V.../bv1...) address: {reason}"
+            )))
         }
     }
 }
@@ -117,14 +212,39 @@ struct CoinSelection {
     change: u64,
 }
 
-/// A recipient with its derived one-time keys.
+/// A recipient resolved to everything needed to emit its output.
 #[derive(Debug, Clone)]
-struct PreparedRecipient {
-    address: String,
-    amount: u64,
-    ephemeral_pubkey: PublicKey,
-    ephemeral_secret: SecretKey,
-    dest_pubkey: PublicKey,
+enum PreparedRecipient {
+    /// A stealth recipient, with the one-time keys derived for it.
+    Stealth {
+        address: String,
+        amount: u64,
+        ephemeral_pubkey: PublicKey,
+        ephemeral_secret: SecretKey,
+        dest_pubkey: PublicKey,
+    },
+    /// A transparent recipient, with the script that pays it.
+    ///
+    /// There are no keys to derive: the value is published in the clear and the
+    /// script alone names the destination.
+    Basecoin {
+        amount: u64,
+        script_pubkey: Vec<u8>,
+    },
+}
+
+impl PreparedRecipient {
+    /// The amount this recipient receives, in satoshis.
+    fn amount(&self) -> u64 {
+        match self {
+            Self::Stealth { amount, .. } | Self::Basecoin { amount, .. } => *amount,
+        }
+    }
+
+    /// Whether this recipient's amount appears on chain in the clear.
+    fn is_transparent(&self) -> bool {
+        matches!(self, Self::Basecoin { .. })
+    }
 }
 
 /// A health assessment of a UTXO set.
@@ -290,7 +410,7 @@ impl TransactionBuilder {
         };
 
         // 4. Add the fee marker and the blinded outputs.
-        let fee_commitment = self.add_ct_data(&mut tx, &prepared)?;
+        let plain_commitment = self.add_ct_data(&mut tx, &prepared)?;
 
         // 5. Build a ring per input.
         let secret_indices = self.add_inputs(&mut tx, &selection.utxos, decoys)?;
@@ -306,7 +426,7 @@ impl TransactionBuilder {
             spend_key,
             scan_key,
             &secret_indices,
-            fee_commitment.as_ref(),
+            plain_commitment.as_ref(),
         )?;
 
         // 8. Collect per-input witnesses for serialization.
@@ -402,6 +522,10 @@ impl TransactionBuilder {
                     recipient.amount
                 )));
             }
+
+            // Fail here rather than midway through building, so a mistyped
+            // address cannot leave a partly constructed transaction behind.
+            classify_address(&recipient.address)?;
         }
 
         if utxos.is_empty() {
@@ -484,10 +608,16 @@ impl TransactionBuilder {
     // Outputs
     // ========================================================================
 
-    /// Add the fee marker and one blinded RingCT output per recipient.
+    /// Add the fee marker, then one output per recipient.
     ///
-    /// Returns the fee commitment, which the MLSAG must include so the daemon's
-    /// balance check succeeds.
+    /// Stealth recipients become blinded [`TxOutput::RingCt`] outputs; basecoin
+    /// recipients become transparent [`TxOutput::Standard`] outputs.
+    ///
+    /// Returns the *plain* commitment, which the MLSAG must include so the
+    /// daemon's balance check succeeds. It commits to the fee plus every
+    /// transparent amount, under a zero blinding factor, because those values are
+    /// public and the daemon recomputes the same commitment from the transaction
+    /// itself (`anon.cpp:38`, and `getPlainValueOut` in Veil Core).
     fn add_ct_data(
         &self,
         tx: &mut Transaction,
@@ -495,7 +625,18 @@ impl TransactionBuilder {
     ) -> Result<Option<(Commitment, Blind)>> {
         tx.outputs.clear();
 
-        let mut fee_commitment = None;
+        // The fee and every transparent output share one commitment. Summing
+        // them first keeps that commitment a single term, matching the daemon.
+        let transparent_total = recipients
+            .iter()
+            .filter(|recipient| recipient.is_transparent())
+            .try_fold(0u64, |acc, recipient| acc.checked_add(recipient.amount()))
+            .ok_or_else(|| VeilError::invalid_input("transparent output amounts overflow"))?;
+
+        let plain_value = tx
+            .fee
+            .checked_add(transparent_total)
+            .ok_or_else(|| VeilError::invalid_input("fee plus transparent amounts overflow"))?;
 
         if tx.fee > 0 {
             // The protocol carries the fee in a data output, LEB128-encoded.
@@ -504,36 +645,70 @@ impl TransactionBuilder {
             v_data.extend_from_slice(&encode_leb128(tx.fee));
 
             tx.outputs.push(TxOutput::Data { v_data });
-
-            // The fee also needs a commitment so the Pedersen sums balance. The
-            // blind must be zero: the daemon verifies against a zero blind in
-            // `anon.cpp:38`.
-            let fee_blind: Blind = [0u8; 32];
-            fee_commitment = Some((create_commitment(tx.fee, &fee_blind)?, fee_blind));
         }
 
-        // Every output gets a random blind. The balance is reconciled by
+        // The plain value needs a commitment so the Pedersen sums balance. The
+        // blind must be zero: the daemon verifies against a zero blind in
+        // `anon.cpp:38`.
+        let plain_commitment = if plain_value > 0 {
+            let plain_blind: Blind = [0u8; 32];
+            Some((create_commitment(plain_value, &plain_blind)?, plain_blind))
+        } else {
+            None
+        };
+
+        // Every blinded output gets a random blind. The balance is reconciled by
         // prepare_mlsag, which derives the blind sum as the commitment row's
         // secret key, so no output needs a computed blind here.
         for recipient in recipients {
+            let (amount, ephemeral_pubkey, ephemeral_secret, dest_pubkey, address) = match recipient
+            {
+                PreparedRecipient::Basecoin {
+                    amount,
+                    script_pubkey,
+                } => {
+                    // A transparent output carries its value in the clear and no
+                    // commitment, so there is nothing to blind or prove here.
+                    // Its value is already inside plain_commitment.
+                    tx.outputs.push(TxOutput::Standard {
+                        amount: *amount,
+                        script_pubkey: script_pubkey.clone(),
+                    });
+
+                    continue;
+                }
+                PreparedRecipient::Stealth {
+                    amount,
+                    ephemeral_pubkey,
+                    ephemeral_secret,
+                    dest_pubkey,
+                    address,
+                } => (
+                    *amount,
+                    *ephemeral_pubkey,
+                    *ephemeral_secret,
+                    *dest_pubkey,
+                    address,
+                ),
+            };
+
             let blind = crate::crypto::generate_blind();
-            let commitment = create_commitment(recipient.amount, &blind)?;
+            let commitment = create_commitment(amount, &blind)?;
 
             // The rewind nonce is the double-hashed ECDH result; see
             // `anonwallet.cpp:1602`.
-            let nonce = ecdh_nonce(&recipient.dest_pubkey, &recipient.ephemeral_secret)?;
+            let nonce = ecdh_nonce(&dest_pubkey, &ephemeral_secret)?;
 
-            let params = select_range_proof_parameters(recipient.amount);
+            let params = select_range_proof_parameters(amount);
             if !validate_range_proof_params(&params) {
                 return Err(VeilError::invalid_input(format!(
-                    "range proof parameters {params:?} are invalid for amount {}",
-                    recipient.amount
+                    "range proof parameters {params:?} are invalid for amount {amount}"
                 )));
             }
 
             let range_proof = generate_range_proof(&crate::crypto::RangeProofParams {
                 commitment: &commitment,
-                value: recipient.amount,
+                value: amount,
                 blind: &blind,
                 nonce: &nonce,
                 message: None,
@@ -543,18 +718,18 @@ impl TransactionBuilder {
             })?;
 
             tx.outputs.push(TxOutput::RingCt {
-                pk: recipient.dest_pubkey,
+                pk: dest_pubkey,
                 commitment,
                 // RingCT vData is the bare ephemeral pubkey, with no prefix.
-                v_data: recipient.ephemeral_pubkey.to_vec(),
+                v_data: ephemeral_pubkey.to_vec(),
                 v_rangeproof: range_proof.proof,
-                amount: recipient.amount,
+                amount,
                 blind: Some(blind),
-                address: recipient.address.clone(),
+                address: address.clone(),
             });
         }
 
-        Ok(fee_commitment)
+        Ok(plain_commitment)
     }
 
     // ========================================================================
@@ -710,7 +885,7 @@ impl TransactionBuilder {
         spend_key: &SecretKey,
         scan_key: &SecretKey,
         secret_indices: &[usize],
-        fee_commitment: Option<&(Commitment, Blind)>,
+        plain_commitment: Option<&(Commitment, Blind)>,
     ) -> Result<()> {
         let num_inputs = tx.inputs.len();
 
@@ -724,7 +899,7 @@ impl TransactionBuilder {
                 spend_key,
                 scan_key,
                 secret_indices[0],
-                fee_commitment,
+                plain_commitment,
             )?;
             tx.inputs[0].script_witness = Some(witness);
         } else {
@@ -735,7 +910,7 @@ impl TransactionBuilder {
                 spend_key,
                 scan_key,
                 secret_indices,
-                fee_commitment,
+                plain_commitment,
             )?;
         }
 
@@ -753,7 +928,7 @@ impl TransactionBuilder {
         spend_key: &SecretKey,
         scan_key: &SecretKey,
         secret_index: usize,
-        fee_commitment: Option<&(Commitment, Blind)>,
+        plain_commitment: Option<&(Commitment, Blind)>,
     ) -> Result<ScriptStack> {
         let input = &tx.inputs[input_index];
         let ring_size = input.ring.len();
@@ -768,12 +943,14 @@ impl TransactionBuilder {
 
         let in_commits = collect_ring_commitments(&input.ring, utxo, decoys)?;
 
-        // The daemon adds the fee commitment before the output commitments
-        // (`anon.cpp:96`), so the order here must match.
+        // The daemon adds the plain commitment before the blinded output
+        // commitments (`anon.cpp:96`), so the order here must match. The plain
+        // commitment covers the fee and every transparent output, all of which
+        // carry no commitment of their own.
         let mut out_commits = Vec::new();
         let mut blinds = vec![utxo.blind];
 
-        if let Some((commitment, blind)) = fee_commitment {
+        if let Some((commitment, blind)) = plain_commitment {
             out_commits.push(*commitment);
             blinds.push(*blind);
         }
@@ -788,7 +965,8 @@ impl TransactionBuilder {
         }
 
         // The daemon passes out_commits.len() for both nOuts and nBlinded
-        // (`anon.cpp:154`), counting the fee commitment among the blinded set.
+        // (`anon.cpp:154`), counting the plain commitment among the blinded set.
+        // Its blind is zero, so including it is arithmetically a no-op.
         let prepared = prepare_mlsag(&PrepareMlsagParams {
             m: &m,
             n_outs: out_commits.len(),
@@ -863,13 +1041,16 @@ impl TransactionBuilder {
         spend_key: &SecretKey,
         scan_key: &SecretKey,
         secret_indices: &[usize],
-        fee_commitment: Option<&(Commitment, Blind)>,
+        plain_commitment: Option<&(Commitment, Blind)>,
     ) -> Result<()> {
         let num_inputs = tx.inputs.len();
 
-        // Gather the blinds the split commitments must balance against.
+        // Gather the blinds the split commitments must balance against. The
+        // plain commitment's blind is zero, so transparent outputs and the fee
+        // contribute nothing here beyond a placeholder term, which is exactly
+        // what keeps the equation balanced.
         let mut output_blinds: Vec<Blind> = Vec::new();
-        if let Some((_, blind)) = fee_commitment {
+        if let Some((_, blind)) = plain_commitment {
             output_blinds.push(*blind);
         }
         for output in &tx.outputs {
@@ -882,7 +1063,7 @@ impl TransactionBuilder {
         for i in 0..num_inputs {
             if i == num_inputs - 1 {
                 // The final blind balances the equation:
-                // sum(split) = sum(outputs) + fee.
+                // sum(split) = sum(blinded outputs) + plain.
                 let mut all_blinds = output_blinds.clone();
                 all_blinds.extend_from_slice(&split_blinds);
                 split_blinds.push(sum_blinds(&all_blinds, output_blinds.len())?);
@@ -1162,17 +1343,29 @@ pub fn derive_destination_key(
     private_add(spend_key, &shared)
 }
 
-/// Derive one-time keys for a recipient's stealth address.
+/// Resolve a recipient to everything its output needs.
+///
+/// A stealth address gets fresh one-time keys; a basecoin address gets the
+/// script that pays it. This is where the two families diverge, and it mirrors
+/// `getTypeOut` plus `buildRecipientData` in the Dart reference.
 fn prepare_recipient(recipient: &Recipient) -> Result<PreparedRecipient> {
-    let ephemeral = generate_ephemeral_keys(&recipient.address)?;
+    match classify_address(&recipient.address)? {
+        Destination::Stealth(_) => {
+            let ephemeral = generate_ephemeral_keys(recipient.address.trim())?;
 
-    Ok(PreparedRecipient {
-        address: recipient.address.clone(),
-        amount: recipient.amount,
-        ephemeral_pubkey: ephemeral.ephemeral_pubkey,
-        ephemeral_secret: ephemeral.ephemeral_secret,
-        dest_pubkey: ephemeral.dest_pubkey,
-    })
+            Ok(PreparedRecipient::Stealth {
+                address: recipient.address.clone(),
+                amount: recipient.amount,
+                ephemeral_pubkey: ephemeral.ephemeral_pubkey,
+                ephemeral_secret: ephemeral.ephemeral_secret,
+                dest_pubkey: ephemeral.dest_pubkey,
+            })
+        }
+        Destination::Basecoin(basecoin) => Ok(PreparedRecipient::Basecoin {
+            amount: recipient.amount,
+            script_pubkey: basecoin.script_pubkey(),
+        }),
+    }
 }
 
 /// Collect the commitment for every ring member.
@@ -1937,5 +2130,395 @@ mod tests {
         let rewound =
             crate::crypto::rewind_range_proof(&recipient_nonce, &commitment, &proof.proof).unwrap();
         assert_eq!(rewound.value, amount);
+    }
+
+    // ========================================================================
+    // Basecoin (transparent) recipients
+    // ========================================================================
+
+    /// A transparent P2PKH destination, distinct from the test wallet.
+    fn basecoin_p2pkh() -> String {
+        crate::basecoin::p2pkh_address_from_hash(&[0x2Au8; 20])
+    }
+
+    /// A transparent P2WPKH destination.
+    fn basecoin_p2wpkh() -> String {
+        crate::basecoin::bech32_address_from_hash(&[0x3Bu8; 20]).unwrap()
+    }
+
+    #[test]
+    fn addresses_are_classified_by_family() {
+        let w = wallet();
+
+        assert!(matches!(
+            classify_address(&w.stealth_address).unwrap(),
+            Destination::Stealth(_)
+        ));
+        assert!(matches!(
+            classify_address(&basecoin_p2pkh()).unwrap(),
+            Destination::Basecoin(BasecoinAddress::P2pkh { .. })
+        ));
+        assert!(matches!(
+            classify_address(&basecoin_p2wpkh()).unwrap(),
+            Destination::Basecoin(BasecoinAddress::P2wpkh { .. })
+        ));
+
+        assert!(classify_address("not an address").is_err());
+        assert!(classify_address("").is_err());
+    }
+
+    #[test]
+    fn destinations_report_their_output_type_and_privacy() {
+        let w = wallet();
+
+        let stealth = classify_address(&w.stealth_address).unwrap();
+        assert_eq!(stealth.output_type(), OutputType::RingCt);
+        assert!(!stealth.is_transparent());
+
+        let basecoin = classify_address(&basecoin_p2pkh()).unwrap();
+        assert_eq!(basecoin.output_type(), OutputType::Standard);
+        assert!(basecoin.is_transparent());
+
+        // The same information must be reachable from a Recipient directly,
+        // since that is what a caller holds before building.
+        assert!(Recipient::new(basecoin_p2pkh(), 1).is_transparent());
+        assert!(!Recipient::new(&w.stealth_address, 1).is_transparent());
+    }
+
+    #[test]
+    fn validation_rejects_an_unpayable_address() {
+        let builder = TransactionBuilder::default();
+        let utxos = vec![owned_utxo(100_000_000, 7, 0x33)];
+
+        let error = builder
+            .validate_inputs(&[Recipient::new("V-nonsense-address", 10_000)], &utxos)
+            .unwrap_err();
+
+        assert!(
+            matches!(error, VeilError::InvalidAddress(_)),
+            "expected an address error, got {error}"
+        );
+    }
+
+    #[test]
+    fn builds_and_verifies_a_transparent_payment() {
+        let builder = TransactionBuilder::new(TransactionBuilderConfig {
+            ring_size: MIN_RING_SIZE,
+            fee_per_kb: DEFAULT_FEE_PER_KB,
+        })
+        .unwrap();
+
+        let w = wallet();
+        let utxos = vec![owned_utxo(100_000_000, 7, 0x33)];
+        let available = decoys(8, 200);
+
+        let send_amount = 10_000_000u64;
+        let address = basecoin_p2pkh();
+
+        let result = builder
+            .build_transaction(
+                &w.spend_secret,
+                &w.scan_secret,
+                &[Recipient::new(address.clone(), send_amount)],
+                &utxos,
+                &available,
+            )
+            .expect("a transparent payment should build and verify");
+
+        // Reaching here means the MLSAG verified, which is the real assertion:
+        // the plain commitment covering fee + transparent value balanced against
+        // the RingCT input.
+        assert_eq!(result.inputs.len(), 1);
+
+        // Fee data output, the transparent recipient, and RingCT change.
+        assert_eq!(result.outputs.len(), 3);
+        assert!(matches!(result.outputs[0], TxOutput::Data { .. }));
+
+        let expected_script = crate::basecoin::address_to_script_pubkey(&address).unwrap();
+        match &result.outputs[1] {
+            TxOutput::Standard {
+                amount,
+                script_pubkey,
+            } => {
+                // The amount is public, exactly as requested.
+                assert_eq!(*amount, send_amount);
+                assert_eq!(script_pubkey, &expected_script);
+            }
+            other => panic!("expected a standard output, got {other:?}"),
+        }
+        assert!(matches!(result.outputs[2], TxOutput::RingCt { .. }));
+
+        // A transparent output carries no commitment and no blind, so it must
+        // not contribute to the blinded set.
+        assert!(result.outputs[1].commitment().is_none());
+        assert!(result.outputs[1].blind().is_none());
+
+        // The serialized form must round-trip, including the standard output.
+        let parsed = crate::serialization::deserialize_transaction(&result.tx_hex).unwrap();
+        assert_eq!(parsed.outputs.len(), 3);
+        assert_eq!(
+            parsed.outputs[1],
+            TxOutput::Standard {
+                amount: send_amount,
+                script_pubkey: expected_script,
+            }
+        );
+        assert_eq!(
+            crate::serialization::extract_fee(&parsed).unwrap(),
+            Some(result.fee)
+        );
+
+        // Value must be conserved: input = recipient + change + fee.
+        assert_eq!(utxos[0].amount, send_amount + result.change + result.fee);
+    }
+
+    #[test]
+    fn builds_and_verifies_a_transparent_bech32_payment() {
+        let builder = TransactionBuilder::new(TransactionBuilderConfig {
+            ring_size: MIN_RING_SIZE,
+            fee_per_kb: DEFAULT_FEE_PER_KB,
+        })
+        .unwrap();
+
+        let w = wallet();
+        let utxos = vec![owned_utxo(100_000_000, 7, 0x44)];
+        let available = decoys(8, 300);
+        let address = basecoin_p2wpkh();
+
+        let result = builder
+            .build_transaction(
+                &w.spend_secret,
+                &w.scan_secret,
+                &[Recipient::new(address.clone(), 5_000_000)],
+                &utxos,
+                &available,
+            )
+            .expect("a P2WPKH payment should build and verify");
+
+        let expected_script = crate::basecoin::address_to_script_pubkey(&address).unwrap();
+        match &result.outputs[1] {
+            TxOutput::Standard {
+                amount,
+                script_pubkey,
+            } => {
+                assert_eq!(*amount, 5_000_000);
+                // OP_0 PUSH20 <program>
+                assert_eq!(script_pubkey.len(), 22);
+                assert_eq!(script_pubkey, &expected_script);
+            }
+            other => panic!("expected a standard output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builds_and_verifies_a_mixed_recipient_transaction() {
+        let builder = TransactionBuilder::new(TransactionBuilderConfig {
+            ring_size: MIN_RING_SIZE,
+            fee_per_kb: DEFAULT_FEE_PER_KB,
+        })
+        .unwrap();
+
+        let w = wallet();
+        let utxos = vec![owned_utxo(200_000_000, 11, 0x55)];
+        let available = decoys(8, 400);
+
+        // One blinded and two transparent recipients in a single transaction:
+        // the plain commitment must cover the fee plus both transparent amounts.
+        let recipients = [
+            Recipient::new(w.stealth_address.clone(), 3_000_000),
+            Recipient::new(basecoin_p2pkh(), 4_000_000),
+            Recipient::new(basecoin_p2wpkh(), 5_000_000),
+        ];
+
+        let result = builder
+            .build_transaction(
+                &w.spend_secret,
+                &w.scan_secret,
+                &recipients,
+                &utxos,
+                &available,
+            )
+            .expect("a mixed transaction should build and verify");
+
+        // Fee, three recipients, and change.
+        assert_eq!(result.outputs.len(), 5);
+        assert!(matches!(result.outputs[0], TxOutput::Data { .. }));
+        assert!(matches!(result.outputs[1], TxOutput::RingCt { .. }));
+        assert!(matches!(result.outputs[2], TxOutput::Standard { .. }));
+        assert!(matches!(result.outputs[3], TxOutput::Standard { .. }));
+        assert!(matches!(result.outputs[4], TxOutput::RingCt { .. }));
+
+        // Recipient order must be preserved, since a caller pairs outputs back
+        // to the requests it made.
+        let transparent: Vec<u64> = result
+            .outputs
+            .iter()
+            .filter_map(|output| match output {
+                TxOutput::Standard { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(transparent, vec![4_000_000, 5_000_000]);
+
+        let total_sent: u64 = recipients.iter().map(|r| r.amount).sum();
+        assert_eq!(utxos[0].amount, total_sent + result.change + result.fee);
+
+        let parsed = crate::serialization::deserialize_transaction(&result.tx_hex).unwrap();
+        assert_eq!(parsed.outputs.len(), 5);
+    }
+
+    #[test]
+    fn builds_and_verifies_a_multi_input_transparent_payment() {
+        // The multi-input path balances via split commitments rather than one
+        // MLSAG over every output, so it needs its own coverage.
+        let builder = TransactionBuilder::new(TransactionBuilderConfig {
+            ring_size: MIN_RING_SIZE,
+            fee_per_kb: DEFAULT_FEE_PER_KB,
+        })
+        .unwrap();
+
+        let w = wallet();
+        let utxos = vec![
+            owned_utxo(30_000_000, 21, 0x61),
+            owned_utxo(30_000_000, 22, 0x62),
+            owned_utxo(30_000_000, 23, 0x63),
+        ];
+        let available = decoys(24, 500);
+
+        let result = builder
+            .build_transaction(
+                &w.spend_secret,
+                &w.scan_secret,
+                &[Recipient::new(basecoin_p2pkh(), 70_000_000)],
+                &utxos,
+                &available,
+            )
+            .expect("a multi-input transparent payment should build and verify");
+
+        assert!(result.inputs.len() > 1);
+        assert!(result
+            .outputs
+            .iter()
+            .any(|output| matches!(output, TxOutput::Standard { .. })));
+
+        // Every input's witness carries its split commitment alongside the
+        // signature.
+        let parsed = crate::serialization::deserialize_transaction(&result.tx_hex).unwrap();
+        for witness in &parsed.witness {
+            assert_eq!(witness.stack.len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_transparent_payment_that_consumes_the_whole_input_has_no_change() {
+        // With no change output the only blinded output disappears, leaving the
+        // plain commitment as the sole output commitment. That is the narrowest
+        // case for the balance check, so it is worth pinning.
+        let builder = TransactionBuilder::new(TransactionBuilderConfig {
+            ring_size: MIN_RING_SIZE,
+            fee_per_kb: DEFAULT_FEE_PER_KB,
+        })
+        .unwrap();
+
+        let w = wallet();
+        let utxos = vec![owned_utxo(100_000_000, 31, 0x71)];
+        let available = decoys(8, 600);
+
+        // Send everything except the fee the builder will charge.
+        let fee = builder.estimate_fee(1, 2);
+        let send_amount = 100_000_000 - fee;
+
+        let result = builder
+            .build_transaction(
+                &w.spend_secret,
+                &w.scan_secret,
+                &[Recipient::new(basecoin_p2pkh(), send_amount)],
+                &utxos,
+                &available,
+            )
+            .expect("a change-free transparent payment should build and verify");
+
+        assert_eq!(result.change, 0);
+
+        // Fee output plus the single transparent recipient, nothing else.
+        assert_eq!(result.outputs.len(), 2);
+        assert!(matches!(result.outputs[0], TxOutput::Data { .. }));
+        assert!(matches!(result.outputs[1], TxOutput::Standard { .. }));
+
+        // No output carries a commitment at all in this case.
+        assert!(result
+            .outputs
+            .iter()
+            .all(|output| output.commitment().is_none()));
+    }
+
+    #[test]
+    fn transparent_change_is_never_produced() {
+        // Change must stay blinded even when every recipient is transparent,
+        // otherwise the wallet would publish its own balance.
+        let builder = TransactionBuilder::new(TransactionBuilderConfig {
+            ring_size: MIN_RING_SIZE,
+            fee_per_kb: DEFAULT_FEE_PER_KB,
+        })
+        .unwrap();
+
+        let w = wallet();
+        let utxos = vec![owned_utxo(100_000_000, 41, 0x81)];
+        let available = decoys(8, 700);
+
+        let result = builder
+            .build_transaction(
+                &w.spend_secret,
+                &w.scan_secret,
+                &[Recipient::new(basecoin_p2pkh(), 1_000_000)],
+                &utxos,
+                &available,
+            )
+            .unwrap();
+
+        assert!(result.change > 0);
+
+        let change_output = result.outputs.last().unwrap();
+        assert!(
+            matches!(change_output, TxOutput::RingCt { .. }),
+            "change must be a blinded RingCT output, got {change_output:?}"
+        );
+        assert!(change_output.blind().is_some());
+    }
+
+    #[test]
+    fn a_transparent_output_is_not_recoverable_as_a_wallet_output() {
+        // A transparent output belongs to whoever controls the script, so the
+        // sending wallet must not treat it as its own.
+        let builder = TransactionBuilder::new(TransactionBuilderConfig {
+            ring_size: MIN_RING_SIZE,
+            fee_per_kb: DEFAULT_FEE_PER_KB,
+        })
+        .unwrap();
+
+        let w = wallet();
+        let utxos = vec![owned_utxo(100_000_000, 51, 0x91)];
+        let available = decoys(8, 800);
+
+        let result = builder
+            .build_transaction(
+                &w.spend_secret,
+                &w.scan_secret,
+                &[Recipient::new(basecoin_p2pkh(), 2_000_000)],
+                &utxos,
+                &available,
+            )
+            .unwrap();
+
+        // The change output is ours; the transparent one is not.
+        let scanned_change =
+            crate::scanner::scan_output(&result.outputs[2], &w.scan_secret, &w.spend_secret)
+                .unwrap();
+        assert!(scanned_change.is_mine);
+
+        let scanned_transparent =
+            crate::scanner::scan_output(&result.outputs[1], &w.scan_secret, &w.spend_secret)
+                .unwrap();
+        assert!(!scanned_transparent.is_mine);
     }
 }

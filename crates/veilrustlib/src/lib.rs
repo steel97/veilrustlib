@@ -14,6 +14,7 @@
 //! - [`types`] — protocol types: outputs, inputs, transactions, UTXOs
 //! - [`crypto`] — commitments, range proofs, MLSAG, ECDH, key images
 //! - [`stealth`] — stealth addresses, wallet creation, key derivation
+//! - [`basecoin`] — transparent addresses (`V...`, `bv1...`) and their scripts
 //! - [`serialization`] — the Veil transaction wire format
 //! - [`transaction_builder`] — RingCT transaction construction
 //! - [`scanner`] — detecting and valuing owned outputs
@@ -72,10 +73,46 @@
 //! # }
 //! ```
 //!
+//! ## Stealth and transparent recipients
+//!
+//! A recipient's address decides how it is paid, and the two forms differ in
+//! what they publish:
+//!
+//! | Address | Output | Amount | Recipient |
+//! |---------|--------|--------|-----------|
+//! | `sv1...` stealth | RingCT, blinded | hidden | hidden |
+//! | `V...` / `bv1...` basecoin | standard, transparent | **public** | **public** |
+//!
+//! Both may appear in the same transaction. The sender stays hidden either way,
+//! protected by the ring, but a transparent output reveals its value and
+//! destination to anyone reading the chain. Change is always returned as a
+//! blinded RingCT output, so paying a transparent recipient never publishes the
+//! sender's remaining balance.
+//!
+//! ```no_run
+//! use veilrustlib::{classify_address, Destination, Recipient};
+//!
+//! # fn example(address: &str) -> Result<(), veilrustlib::VeilError> {
+//! // Check what an address will publish before sending to it.
+//! match classify_address(address)? {
+//!     Destination::Stealth(_) => println!("blinded: amount and recipient stay private"),
+//!     Destination::Basecoin(_) => println!("transparent: the amount will be public"),
+//! }
+//!
+//! let recipient = Recipient::new(address, 100_000_000);
+//! assert_eq!(recipient.is_transparent(), !address.starts_with("sv1"));
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! ## Security notes
 //!
 //! - A wallet's spend and scan secrets grant full control of its funds. The
 //!   `*_hex` accessors exist for backup; avoid logging their output.
+//! - Paying a basecoin address publishes the amount and the destination. Prefer
+//!   a stealth address when that matters, and see
+//!   [`Recipient::is_transparent`](transaction_builder::Recipient::is_transparent)
+//!   to check before broadcasting.
 //! - `importlightwalletaddress` and `getwatchonlytxes` send the scan *private*
 //!   key to the node, which can then link every output belonging to the wallet.
 //!   Use them only against a node you control.
@@ -85,6 +122,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod basecoin;
 pub mod buffer_reader;
 pub mod crypto;
 pub mod ct_utils;
@@ -119,13 +157,17 @@ pub use hdwallet::{
     derive_stealth_keys, derive_stealth_keys_from_seed, mnemonic_to_seed, AccountType, ExtendedKey,
     HdAccount, HdWallet, StealthKeys, BIP44_PURPOSE, VEIL_BIP44_ID, VEIL_RINGCT_ACCOUNT,
 };
+pub use basecoin::{
+    address_to_script_pubkey, decode_basecoin_address, is_basecoin_address, BasecoinAddress,
+};
 pub use stealth::{
     create_wallet, decode_stealth_address, generate_ephemeral_keys, generate_stealth_address,
     is_valid_address, restore_wallet, validate_address, VeilWallet,
 };
 pub use transaction_builder::{
-    BuildTransactionResult, Recipient, TransactionBuilder, TransactionBuilderConfig, WalletHealth,
-    DEFAULT_RING_SIZE, MAX_ANON_INPUTS, MAX_RING_SIZE, MIN_RING_SIZE,
+    classify_address, BuildTransactionResult, Destination, Recipient, TransactionBuilder,
+    TransactionBuilderConfig, WalletHealth, DEFAULT_RING_SIZE, MAX_ANON_INPUTS, MAX_RING_SIZE,
+    MIN_RING_SIZE,
 };
 pub use utils::{
     bytes_to_hex, format_amount, hex_to_bytes, satoshis_to_veil, veil_to_satoshis,

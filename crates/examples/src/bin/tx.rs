@@ -6,7 +6,9 @@
 //! - The sender wallet is derived from a BIP39 seed phrase in the environment
 //!   rather than freshly generated, so the transaction spends real coins.
 //! - The recipient address comes from the environment rather than a throwaway
-//!   generated address.
+//!   generated address, and may be either family: an `sv1...` stealth address,
+//!   paid as a blinded RingCT output, or a `V...`/`bv1...` basecoin address, paid
+//!   as a transparent output.
 //! - Input UTXOs are scanned from the node instead of being fabricated, and the
 //!   scan is cached: a later run resumes 20 records before where the last one
 //!   stopped rather than re-walking the whole wallet history.
@@ -23,7 +25,7 @@
 //!
 //! ```text
 //! VEIL_SEED_PHRASE        required  the BIP39 mnemonic, space separated
-//! VEIL_RECIPIENT_ADDRESS  required  destination sv1... stealth address
+//! VEIL_RECIPIENT_ADDRESS  required  destination sv1... (private) or V.../bv1... (public)
 //! VEIL_SEND_AMOUNT        required  amount to send, in VEIL (e.g. 0.5)
 //! VEIL_SEED_PASSPHRASE    optional  BIP39 passphrase, defaults to empty
 //! VEIL_ACCOUNT_ID         optional  BIP44 account, defaults to 0
@@ -48,6 +50,18 @@
 //!
 //! ## A note on privacy
 //!
+//! The recipient address decides what the transaction publishes:
+//!
+//! | Address | Output | Amount | Recipient |
+//! |---------|--------|--------|-----------|
+//! | `sv1...` stealth | RingCT, blinded | hidden | hidden |
+//! | `V...` / `bv1...` basecoin | standard, transparent | **public** | **public** |
+//!
+//! The sender is hidden either way, protected by the ring, and change is always
+//! returned as a blinded RingCT output, so a transparent payment never publishes
+//! the sender's remaining balance. The example prints which form it is building
+//! before it builds it.
+//!
 //! Scanning for UTXOs uses `getwatchonlytxes`, which sends the scan *private*
 //! key to the node; the node can then link every output belonging to this
 //! wallet. Point `VEIL_NODE_URL` at a node you control if that matters.
@@ -63,9 +77,12 @@ use veilrustlib::balance::BalanceScanner;
 use veilrustlib::cache::{RecoveryPolicy, RedbStore};
 use veilrustlib::hdwallet::{derive_stealth_keys, verify_mnemonic_shape, AccountType, StealthKeys};
 use veilrustlib::rpc::{fetch_decoy_outputs, RpcClient};
+use veilrustlib::basecoin::BasecoinAddress;
 use veilrustlib::stealth::{validate_address, AddressValidation};
-use veilrustlib::transaction_builder::{Recipient, TransactionBuilder, TransactionBuilderConfig};
-use veilrustlib::types::{AnonOutput, Utxo};
+use veilrustlib::transaction_builder::{
+    classify_address, Destination, Recipient, TransactionBuilder, TransactionBuilderConfig,
+};
+use veilrustlib::types::{AnonOutput, TxOutput, Utxo};
 use veilrustlib::utils::{bytes_to_hex, satoshis_to_veil, veil_to_satoshis};
 use veilrustlib::{VeilError, DEFAULT_RING_SIZE, MAX_ANON_INPUTS};
 
@@ -119,22 +136,48 @@ fn keys_from_environment() -> Result<StealthKeys, VeilError> {
 
 /// Read and validate the destination address.
 ///
-/// This is step 2 of the plan. `validate_address` is used rather than the
-/// cheaper surface check because a typo here sends funds nowhere recoverable.
-fn recipient_address_from_environment() -> Result<String, VeilError> {
+/// This is step 2 of the plan. `classify_address` is used rather than the cheaper
+/// surface check because a typo here sends funds nowhere recoverable: it verifies
+/// the checksum and, for a stealth address, the embedded public keys.
+///
+/// Both address families are accepted, and the choice changes what the
+/// transaction publishes:
+///
+/// - `sv1...` stealth: a blinded RingCT output, hiding the amount and recipient
+/// - `V...` or `bv1...` basecoin: a transparent output, publishing both
+///
+/// The returned [`Destination`] is carried through to the report so the example
+/// can state which was built.
+fn recipient_from_environment() -> Result<(String, Destination), VeilError> {
     let address = std::env::var("VEIL_RECIPIENT_ADDRESS").map_err(|_| {
         VeilError::invalid_input(
-            "VEIL_RECIPIENT_ADDRESS is not set; export the destination sv1... address",
+            "VEIL_RECIPIENT_ADDRESS is not set; export the destination address, \
+             either sv1... (private) or V.../bv1... (transparent)",
         )
     })?;
     let address = address.trim().to_string();
 
-    match validate_address(&address) {
-        AddressValidation::Valid(_) => Ok(address),
-        AddressValidation::Invalid(reason) => Err(VeilError::invalid_input(format!(
-            "VEIL_RECIPIENT_ADDRESS is not a valid Veil stealth address: {reason}"
-        ))),
-    }
+    // classify_address reports the basecoin failure when neither decode succeeds,
+    // which is the more likely mistake, but an sv1 typo deserves the stealth
+    // decoder's own explanation. Ask it directly in that case.
+    let destination = match classify_address(&address) {
+        Ok(destination) => destination,
+        Err(error) => {
+            if let AddressValidation::Invalid(reason) = validate_address(&address) {
+                if address.to_ascii_lowercase().starts_with("sv1") {
+                    return Err(VeilError::invalid_input(format!(
+                        "VEIL_RECIPIENT_ADDRESS is not a valid Veil stealth address: {reason}"
+                    )));
+                }
+            }
+
+            return Err(VeilError::invalid_input(format!(
+                "VEIL_RECIPIENT_ADDRESS is unusable: {error}"
+            )));
+        }
+    };
+
+    Ok((address, destination))
 }
 
 /// Read the send amount, given in VEIL, and convert it to satoshis.
@@ -241,7 +284,7 @@ async fn run() -> Result<(), VeilError> {
     // 2. Read the recipient and the amount
     // ------------------------------------------------------------------
     println!("2. Reading the payment details...");
-    let recipient_address = recipient_address_from_environment()?;
+    let (recipient_address, destination) = recipient_from_environment()?;
     let send_amount = send_amount_from_environment()?;
 
     println!("   To:     {recipient_address}");
@@ -249,6 +292,28 @@ async fn run() -> Result<(), VeilError> {
         "   Amount: {} VEIL ({send_amount} satoshis)",
         satoshis_to_veil(send_amount)
     );
+
+    // Say plainly what this address publishes, because the two families differ in
+    // exactly that and the difference is not recoverable after broadcast.
+    match &destination {
+        Destination::Stealth(_) => {
+            println!("   Output: RingCT, blinded");
+            println!("   The amount and the recipient stay private.");
+        }
+        Destination::Basecoin(basecoin) => {
+            let kind = match basecoin {
+                BasecoinAddress::P2pkh { .. } => "P2PKH",
+                BasecoinAddress::P2wpkh { .. } => "P2WPKH",
+            };
+
+            println!("   Output: standard, transparent ({kind})");
+            println!(
+                "   Warning: the amount and the destination will be public on chain.\n   \
+                 Only the sender stays hidden, protected by the ring. Send to an\n   \
+                 sv1... stealth address instead if that is not what you want."
+            );
+        }
+    }
 
     if recipient_address == sender_address {
         println!("   Note: the destination is this wallet's own address.");
@@ -275,8 +340,8 @@ async fn run() -> Result<(), VeilError> {
     // The cache holds the UTXOs an earlier run already decoded, so only records
     // after the stored resume point are fetched. `getwatchonlytxes` is the
     // expensive call, and this is what avoids re-walking the whole history.
-    let cache_path = std::env::var("VEIL_CACHE_PATH")
-        .unwrap_or_else(|_| "veil-balance-cache.redb".to_string());
+    let cache_path =
+        std::env::var("VEIL_CACHE_PATH").unwrap_or_else(|_| "veil-balance-cache.redb".to_string());
 
     let (store, recreated) = RedbStore::open_or_recreate(&cache_path)?;
     println!("   Cache:           {}", store.path().display());
@@ -439,6 +504,31 @@ async fn run() -> Result<(), VeilError> {
             utxo.txid,
             utxo.vout
         );
+    }
+    println!();
+
+    // Show what each output reveals, which is where the two address families
+    // become visible in the finished transaction.
+    println!("   Creating:");
+    for (i, output) in result.outputs.iter().enumerate() {
+        match output {
+            TxOutput::Data { .. } => println!("     {}. fee marker", i + 1),
+            TxOutput::Standard { amount, .. } => println!(
+                "     {}. {} VEIL, transparent (amount visible on chain)",
+                i + 1,
+                satoshis_to_veil(*amount)
+            ),
+            TxOutput::RingCt { amount, .. } => println!(
+                "     {}. {} VEIL, blinded (amount hidden on chain)",
+                i + 1,
+                satoshis_to_veil(*amount)
+            ),
+            TxOutput::Ct { amount, .. } => println!(
+                "     {}. {} VEIL, blinded CT",
+                i + 1,
+                satoshis_to_veil(*amount)
+            ),
+        }
     }
     println!();
 

@@ -29,8 +29,10 @@ pub enum VeilError {
         available: u64,
     },
 
-    /// A stealth address was malformed or failed validation.
-    #[error("invalid stealth address: {0}")]
+    /// An address was malformed or failed validation.
+    ///
+    /// Covers both families: stealth (`sv1...`) and basecoin (`V...`, `bv1...`).
+    #[error("invalid address: {0}")]
     InvalidAddress(String),
 
     /// A value did not satisfy a documented precondition.

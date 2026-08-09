@@ -9,7 +9,39 @@ repository.workspace = true
 
 [dependencies]
 veilrustlib = { path = "../veilrustlib", features = ["rpc", "cache-redb"] }
-tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "time"] }
+# "signal" lets veilfaucet shut its Discord shard down cleanly on Ctrl-C.
+tokio = { version = "1.44.2", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "time",
+] }
+
+# veilfaucet only. Kept out of the other examples' build by nothing more than
+# not being used there; Cargo compiles a dependency once per workspace.
+#
+# serenity is the Discord client, standing in for Dart's nyxx/nyxx_commands.
+# Default features are off to skip the voice stack, which a faucet never needs.
+serenity = { version = "0.12.5", default-features = false, features = [
+    "builder",
+    "cache",
+    "client",
+    "collector",
+    "gateway",
+    "http",
+    "model",
+    "rustls_backend",
+    "utils",
+] }
+# turso is a pure-Rust SQLite engine, so db.sqlite stays byte-compatible with
+# the Dart bot's file without a C toolchain or bundled libsqlite3.
+turso = { version = "0.7.2", default-features = false }
+#
+# There is deliberately no .env crate here. dotenvy and its peers reject an
+# unquoted value containing spaces, which is exactly how the Dart bot's
+# .env.example stores VEIL_MNEMONIC, and a rejected line discards every key
+# after it. veilfaucet's dotenv module reproduces Dart's own parser instead, so
+# an existing .env works unedited. See crates/examples/src/bin/veilfaucet/dotenv.rs.
 
 [[bin]]
 name = "get-balance"
@@ -22,3 +54,7 @@ path = "src/bin/tx.rs"
 [[bin]]
 name = "cached-balance"
 path = "src/bin/cached_balance.rs"
+
+[[bin]]
+name = "veilfaucet"
+path = "src/bin/veilfaucet/main.rs"

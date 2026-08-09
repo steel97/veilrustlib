@@ -382,6 +382,9 @@ pub fn validate_address(address: &str) -> AddressValidation {
             }
             AddressValidation::Valid(decoded)
         }
+        // Unwrap the error's own "invalid address" prefix, which would otherwise
+        // nest when this reason is reported inside another address error.
+        Err(VeilError::InvalidAddress(reason)) => AddressValidation::Invalid(reason),
         Err(e) => AddressValidation::Invalid(format!("invalid address format: {e}")),
     }
 }
