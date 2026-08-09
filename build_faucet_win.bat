@@ -1,0 +1,1 @@
+cargo build -p veilrustlib-examples --bin veilfaucet --release
