@@ -3,3 +3,6 @@ ref
 plans
 run_getbalance.bat
 run_tx.bat
+
+# Balance cache files hold decoded UTXOs, including amounts and blinds.
+*.redb

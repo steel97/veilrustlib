@@ -52,6 +52,13 @@ pub enum VeilError {
     /// JSON encoding or decoding failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// The balance cache could not be read or written.
+    ///
+    /// The cache is derived data, so this is recoverable: the node remains the
+    /// source of truth and callers can fall back to a full scan.
+    #[error("cache error: {0}")]
+    Cache(String),
 }
 
 impl VeilError {
@@ -68,5 +75,10 @@ impl VeilError {
     /// Build a [`VeilError::Rpc`] from anything string-like.
     pub fn rpc(msg: impl Into<String>) -> Self {
         Self::Rpc(msg.into())
+    }
+
+    /// Build a [`VeilError::Cache`] from anything string-like.
+    pub fn cache(msg: impl Into<String>) -> Self {
+        Self::Cache(msg.into())
     }
 }

@@ -9,6 +9,10 @@
 //!
 //! Gated behind the `rpc` feature.
 
+use crate::cache::{
+    wallet_id, BalanceCache, CacheInfo, CacheLoad, CacheStore, CachedUtxo, CachedUtxoCt,
+    RecoveryPolicy, WalletCacheData,
+};
 use crate::error::{Result, VeilError};
 use crate::rpc::RpcClient;
 use crate::types::{KeyImage, SecretKey, Utxo, UtxoCt};
@@ -394,6 +398,687 @@ where
         total_outputs_scanned,
         owned_outputs_found,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Cached scanning
+// ---------------------------------------------------------------------------
+
+/// A balance result together with what the cache contributed to it.
+#[derive(Debug, Clone, Default)]
+pub struct CachedBalanceResult {
+    /// The balance itself, identical in meaning to an uncached scan's result.
+    ///
+    /// [`BalanceResult::total_outputs_scanned`] counts only records actually
+    /// fetched this call, so on a cache hit it reflects the incremental work
+    /// done rather than the size of the wallet's history.
+    pub balance: BalanceResult,
+    /// What the cache contributed, and why it was rejected when it was.
+    pub cache: CacheInfo,
+}
+
+/// A balance result for CT outputs, together with cache statistics.
+#[derive(Debug, Clone, Default)]
+pub struct CachedBalanceResultCt {
+    /// The CT balance.
+    pub balance: BalanceResultCt,
+    /// What the cache contributed.
+    pub cache: CacheInfo,
+}
+
+/// Scans a wallet's balance, optionally through a persistent cache.
+///
+/// Without a cache this behaves like [`get_balance`]: every record is fetched
+/// from the node. With one, only records added since the last scan are fetched,
+/// and cached UTXOs are re-verified according to a [`RecoveryPolicy`].
+///
+/// ```no_run
+/// # use veilrustlib::balance::BalanceScanner;
+/// # use veilrustlib::cache::{MemoryStore, RecoveryPolicy};
+/// # use veilrustlib::rpc::RpcClient;
+/// # async fn example(client: &RpcClient, spend: &[u8; 32], scan: &[u8; 32])
+/// #     -> Result<(), veilrustlib::VeilError> {
+/// let store = MemoryStore::new();
+///
+/// let result = BalanceScanner::new(client)
+///     .with_cache(&store)
+///     .with_recovery(RecoveryPolicy::Rewind(50))
+///     .balance(spend, scan)
+///     .await?;
+///
+/// println!("{} satoshis, {} from cache", result.balance.total_balance, result.cache.loaded);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## Failure behaviour
+///
+/// A cache is an optimization and is never allowed to break a scan. An
+/// unreachable store, a corrupt record, or one written by another schema
+/// version all fall back to a full scan from the node, with the reason recorded
+/// in [`CacheInfo::note`]. Write failures are reported the same way rather than
+/// returned as errors, which is what lets the same code path run on wasm with no
+/// database available.
+pub struct BalanceScanner<'a> {
+    client: &'a RpcClient,
+    store: Option<&'a dyn CacheStore>,
+    recovery: RecoveryPolicy,
+    key_image_batch_size: Option<usize>,
+    extra_spent_outpoints: HashSet<String>,
+}
+
+impl<'a> BalanceScanner<'a> {
+    /// Scan through `client`, with no cache.
+    pub fn new(client: &'a RpcClient) -> Self {
+        Self {
+            client,
+            store: None,
+            recovery: RecoveryPolicy::default(),
+            key_image_batch_size: None,
+            extra_spent_outpoints: HashSet::new(),
+        }
+    }
+
+    /// Cache results in `store`.
+    ///
+    /// Pass a [`crate::cache::RedbStore`] to persist to a single file, or a
+    /// [`crate::cache::MemoryStore`] where there is no filesystem.
+    pub fn with_cache(mut self, store: &'a dyn CacheStore) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Set how much of the cache to re-verify against the node.
+    ///
+    /// Defaults to [`RecoveryPolicy::Rewind`] with
+    /// [`crate::cache::DEFAULT_REWIND_RECORDS`] records.
+    pub fn with_recovery(mut self, policy: RecoveryPolicy) -> Self {
+        self.recovery = policy;
+        self
+    }
+
+    /// Set how many key images to check per RPC round trip.
+    pub fn with_key_image_batch_size(mut self, size: usize) -> Self {
+        self.key_image_batch_size = Some(size);
+        self
+    }
+
+    /// Supply CT outpoints known to be spent, formatted `txid:vout`.
+    ///
+    /// CT outputs have no key images, so the node cannot be asked whether one
+    /// was spent. These are merged into the cached set and persisted.
+    pub fn with_spent_outpoints(mut self, outpoints: HashSet<String>) -> Self {
+        self.extra_spent_outpoints = outpoints;
+        self
+    }
+
+    /// Fetch the RingCT balance, using and updating the cache.
+    pub async fn balance(
+        &self,
+        spend_secret: &SecretKey,
+        scan_secret: &SecretKey,
+    ) -> Result<CachedBalanceResult> {
+        self.scan(spend_secret, scan_secret, false).await
+    }
+
+    /// Return the cached RingCT balance without contacting the node.
+    ///
+    /// Makes no requests at all, so it returns as fast as the store can be read.
+    /// This is the call a UI makes on startup to show the last known balance
+    /// immediately, then follows with [`Self::balance`] to revalidate.
+    ///
+    /// The result may be stale, and [`CacheInfo::up_to_date`] is false to say so.
+    /// With no cache configured, or with nothing cached yet, the balance is zero
+    /// and [`CacheInfo::loaded`] is zero.
+    pub async fn cached_balance(
+        &self,
+        spend_secret: &SecretKey,
+        scan_secret: &SecretKey,
+    ) -> Result<CachedBalanceResult> {
+        let cache_only = Self {
+            client: self.client,
+            store: self.store,
+            recovery: RecoveryPolicy::CacheOnly,
+            key_image_batch_size: self.key_image_batch_size,
+            extra_spent_outpoints: self.extra_spent_outpoints.clone(),
+        };
+
+        cache_only.scan(spend_secret, scan_secret, false).await
+    }
+
+    /// Return the cached CT balance without contacting the node.
+    ///
+    /// The CT counterpart of [`Self::cached_balance`].
+    pub async fn cached_balance_ct(
+        &self,
+        spend_secret: &SecretKey,
+        scan_secret: &SecretKey,
+    ) -> Result<CachedBalanceResultCt> {
+        let cache_only = Self {
+            client: self.client,
+            store: self.store,
+            recovery: RecoveryPolicy::CacheOnly,
+            key_image_batch_size: self.key_image_batch_size,
+            extra_spent_outpoints: self.extra_spent_outpoints.clone(),
+        };
+
+        cache_only.scan_ct(spend_secret, scan_secret, false).await
+    }
+
+    /// Fetch the RingCT balance, re-walking every record from the beginning.
+    ///
+    /// Ignores both the cached UTXOs and the cached resume point, so it costs the
+    /// same as a first-ever scan. The cache is rebuilt from the result, which
+    /// makes this the way to audit a cache suspected of being wrong in a way the
+    /// integrity checks cannot detect.
+    pub async fn rescan(
+        &self,
+        spend_secret: &SecretKey,
+        scan_secret: &SecretKey,
+    ) -> Result<CachedBalanceResult> {
+        self.scan(spend_secret, scan_secret, true).await
+    }
+
+    /// Delete this wallet's cached state.
+    ///
+    /// Does nothing when no cache is configured.
+    pub fn clear_cache(&self, scan_secret: &SecretKey) -> Result<()> {
+        match self.store {
+            Some(store) => BalanceCache::new(store).clear(&wallet_id(scan_secret)),
+            None => Ok(()),
+        }
+    }
+
+    /// Read the cached state without contacting the node.
+    ///
+    /// Returns [`CacheLoad::Unavailable`] when no cache is configured, since
+    /// from the caller's point of view that is the same situation as a store
+    /// that cannot be read.
+    pub fn peek_cache(&self, scan_secret: &SecretKey) -> CacheLoad {
+        match self.store {
+            Some(store) => BalanceCache::new(store).load(&wallet_id(scan_secret)),
+            None => CacheLoad::Unavailable("no cache is configured".to_string()),
+        }
+    }
+
+    /// Options for one incremental pass.
+    fn options(&self, start_index: u64, known_spent: HashSet<String>) -> GetBalanceOptions {
+        GetBalanceOptions {
+            known_spent_key_images: known_spent,
+            start_index,
+            key_image_batch_size: self.key_image_batch_size,
+        }
+    }
+
+    /// Load the cached record, deciding whether it can be trusted.
+    ///
+    /// Returns the starting state and the cache statistics that describe how it
+    /// was obtained. A damaged record is discarded here, so callers downstream
+    /// only ever see data that passed every check.
+    fn open_cache(
+        &self,
+        cache: &BalanceCache<'_>,
+        id: &str,
+        force_full: bool,
+    ) -> (WalletCacheData, CacheInfo) {
+        let mut info = CacheInfo {
+            enabled: true,
+            ..Default::default()
+        };
+
+        if force_full {
+            info.rebuilt = true;
+            info.note = Some("a full rescan was requested".to_string());
+            return (WalletCacheData::new(id), info);
+        }
+
+        match cache.load(id) {
+            CacheLoad::Loaded(data) => {
+                info.loaded = data.utxos.len() + data.ct_utxos.len();
+                (*data, info)
+            }
+            CacheLoad::Missing => (WalletCacheData::new(id), info),
+            CacheLoad::Corrupt(reason) => {
+                info.rebuilt = true;
+                info.note = Some(format!("cache was corrupt, rebuilding: {reason}"));
+                // Drop the bad record so a later failure cannot resurrect it.
+                let _ = cache.clear(id);
+                (WalletCacheData::new(id), info)
+            }
+            CacheLoad::Stale { found, expected } => {
+                info.rebuilt = true;
+                info.note = Some(format!(
+                    "cache uses schema version {found}, this build expects {expected}; rebuilding"
+                ));
+                let _ = cache.clear(id);
+                (WalletCacheData::new(id), info)
+            }
+            CacheLoad::Unavailable(reason) => {
+                info.rebuilt = true;
+                info.note = Some(format!("cache is unavailable, scanning from the node: {reason}"));
+                (WalletCacheData::new(id), info)
+            }
+        }
+    }
+
+    /// Persist `data`, downgrading a write failure to a note.
+    ///
+    /// A cache that cannot be written is a lost optimization, not a failed
+    /// balance query.
+    fn save_cache(&self, cache: &BalanceCache<'_>, data: &WalletCacheData, info: &mut CacheInfo) {
+        match cache.save(data) {
+            Ok(()) => info.saved = true,
+            Err(e) => {
+                info.saved = false;
+                let note = format!("results could not be cached: {e}");
+                info.note = Some(match info.note.take() {
+                    Some(existing) => format!("{existing}; {note}"),
+                    None => note,
+                });
+            }
+        }
+    }
+
+    /// The RingCT scan, cached or not.
+    async fn scan(
+        &self,
+        spend_secret: &SecretKey,
+        scan_secret: &SecretKey,
+        force_full: bool,
+    ) -> Result<CachedBalanceResult> {
+        // Validate up front so a bad batch size fails before any RPC or IO.
+        let batch_size = self.options(0, HashSet::new()).batch_size()?;
+
+        let Some(store) = self.store else {
+            let balance = get_balance(
+                self.client,
+                spend_secret,
+                scan_secret,
+                &self.options(0, HashSet::new()),
+            )
+            .await?;
+
+            return Ok(CachedBalanceResult {
+                balance,
+                cache: CacheInfo::default(),
+            });
+        };
+
+        let cache = BalanceCache::new(store);
+        let id = wallet_id(scan_secret);
+        let (mut data, mut info) = self.open_cache(&cache, &id, force_full);
+
+        // CacheOnly answers from stored data alone, with no requests at all.
+        // A UI uses this to paint the last known balance immediately, then runs
+        // a revalidating scan behind it.
+        if self.recovery == RecoveryPolicy::CacheOnly && !info.rebuilt {
+            let utxos: Vec<Utxo> = data
+                .utxos
+                .iter()
+                .map(|u| u.to_utxo())
+                .collect::<Result<_>>()?;
+
+            let total_balance = utxos
+                .iter()
+                .fold(0u64, |acc, u| acc.saturating_add(u.amount));
+
+            info.skipped_scan = true;
+            // Deliberately not up to date: nothing was checked against the node.
+            info.up_to_date = false;
+            info.note = Some(
+                "served from cache without contacting the node; may be stale".to_string(),
+            );
+
+            return Ok(CachedBalanceResult {
+                balance: BalanceResult {
+                    total_balance,
+                    utxos,
+                    last_processed_index: data.last_processed_index,
+                    spent_key_images: data.spent_key_images.iter().cloned().collect(),
+                    total_outputs_scanned: 0,
+                    owned_outputs_found: 0,
+                },
+                cache: info,
+            });
+        }
+
+        // The chain tip gates the expensive record walk. Outputs and spends can
+        // only appear in new blocks, so an unmoved tip means the walk cannot
+        // discover anything.
+        let tip = self.client.get_blockchain_info().await?.blocks;
+        let chain_moved = tip == 0 || tip != data.scanned_at_height;
+
+        let mut spent: HashSet<String> = data.spent_key_images.iter().cloned().collect();
+
+        // Cached entries must decode before they can be trusted. A single bad
+        // field means the record is unusable, so fall back to a full scan
+        // rather than reporting a balance built from partial data.
+        let mut surviving = std::mem::take(&mut data.utxos);
+        if let Some(bad) = surviving.iter().find(|u| u.to_utxo().is_err()) {
+            let reason = format!(
+                "cached UTXO {} did not decode, rebuilding from the node",
+                bad.outpoint()
+            );
+
+            surviving.clear();
+            data = WalletCacheData::new(&id);
+            spent.clear();
+            info.loaded = 0;
+            info.rebuilt = true;
+            info.note = Some(reason);
+            let _ = cache.clear(&id);
+        }
+
+        // Entries already known to be spent never needed re-checking.
+        let before = surviving.len();
+        surviving.retain(|u| !spent.contains(&u.key_image));
+        info.dropped += before - surviving.len();
+
+        // Re-check every cached key image. This is scoped to the wallet's own
+        // UTXOs, so it is a small number of requests, and checking all of them
+        // is what makes a spend impossible to miss.
+        //
+        // This runs even when the chain tip has not moved: a spend enters the
+        // mempool before it is mined, and `checkkeyimages` reports that through
+        // `spentinmempool`. Gating this on the tip would let a UTXO that is
+        // already being spent still look spendable, which is how a cached
+        // balance turns into an attempted double spend.
+        if !surviving.is_empty() {
+            let key_images: Vec<KeyImage> = surviving
+                .iter()
+                .map(|u| u.key_image_bytes())
+                .collect::<Result<_>>()?;
+
+            check_key_images_spent_status(self.client, &key_images, &mut spent, batch_size).await?;
+            info.revalidated = surviving.len();
+
+            let before = surviving.len();
+            surviving.retain(|u| !spent.contains(&u.key_image));
+            info.dropped += before - surviving.len();
+        }
+
+        // Walk records, rewinding the resume point so the tail the previous scan
+        // already covered is re-read. Skipped entirely when the tip has not
+        // moved, since `getwatchonlytxes` is the expensive call and no new
+        // records can exist.
+        let mut fresh: Vec<CachedUtxo> = Vec::new();
+        let mut total_outputs_scanned = 0usize;
+        let mut owned_outputs_found = 0usize;
+        let mut scanned_to = data.last_processed_index;
+
+        info.skipped_scan = !chain_moved && !info.rebuilt;
+        info.up_to_date = info.skipped_scan;
+
+        if info.skipped_scan {
+            info.note = Some(format!(
+                "chain tip is unchanged at height {tip}; no records were fetched"
+            ));
+        } else {
+            // A forced rescan discards the resume point entirely; otherwise the
+            // policy decides how far back to rewind.
+            let resume_from = if force_full {
+                0
+            } else {
+                self.recovery.resume_index(data.last_processed_index)
+            };
+            info.resumed_from = Some(resume_from);
+
+            let result = get_balance_with_callback(
+                self.client,
+                spend_secret,
+                scan_secret,
+                &self.options(resume_from, spent.clone()),
+                |page| fresh.extend(page.iter().map(CachedUtxo::from_parsed)),
+            )
+            .await?;
+
+            spent.extend(result.spent_key_images.iter().cloned());
+            total_outputs_scanned = result.total_outputs_scanned;
+            owned_outputs_found = result.owned_outputs_found;
+            // Never move the resume point backwards: a rewound scan that finds
+            // nothing new must not lower the high-water mark.
+            scanned_to = result.last_processed_index.max(data.last_processed_index);
+            info.up_to_date = true;
+        }
+
+        // Merge, keeping the cached entries and adding outpoints not already
+        // held. The node can re-report a record, so dedupe rather than trust
+        // the pagination to be exact.
+        let mut seen: HashSet<String> = surviving.iter().map(|u| u.outpoint()).collect();
+        for utxo in fresh {
+            if seen.insert(utxo.outpoint()) {
+                surviving.push(utxo);
+            }
+        }
+
+        // The scan may have learned about spends affecting cached entries.
+        surviving.retain(|u| !spent.contains(&u.key_image));
+
+        let utxos: Vec<Utxo> = surviving
+            .iter()
+            .map(|u| u.to_utxo())
+            .collect::<Result<_>>()?;
+
+        let total_balance = utxos
+            .iter()
+            .fold(0u64, |acc, u| acc.saturating_add(u.amount));
+
+        let last_processed_index = scanned_to;
+
+        data.last_processed_index = last_processed_index;
+        data.utxos = surviving;
+        data.spent_key_images = spent.iter().cloned().collect();
+        data.scanned_at_height = tip;
+
+        self.save_cache(&cache, &data, &mut info);
+
+        Ok(CachedBalanceResult {
+            balance: BalanceResult {
+                total_balance,
+                utxos,
+                last_processed_index,
+                spent_key_images: spent,
+                total_outputs_scanned,
+                owned_outputs_found,
+            },
+            cache: info,
+        })
+    }
+
+    /// Fetch the CT balance, using and updating the cache.
+    ///
+    /// CT outputs carry no key images, so [`RecoveryPolicy`] does not apply:
+    /// there is no node call that can re-check a cached CT entry. Spends must be
+    /// supplied through [`Self::with_spent_outpoints`], which is merged into the
+    /// cached set and persisted for later calls.
+    pub async fn balance_ct(
+        &self,
+        spend_secret: &SecretKey,
+        scan_secret: &SecretKey,
+    ) -> Result<CachedBalanceResultCt> {
+        self.scan_ct(spend_secret, scan_secret, false).await
+    }
+
+    /// Fetch the CT balance, ignoring any cached state.
+    pub async fn rescan_ct(
+        &self,
+        spend_secret: &SecretKey,
+        scan_secret: &SecretKey,
+    ) -> Result<CachedBalanceResultCt> {
+        self.scan_ct(spend_secret, scan_secret, true).await
+    }
+
+    /// The CT scan, cached or not.
+    async fn scan_ct(
+        &self,
+        spend_secret: &SecretKey,
+        scan_secret: &SecretKey,
+        force_full: bool,
+    ) -> Result<CachedBalanceResultCt> {
+        let Some(store) = self.store else {
+            let balance = get_balance_ct(
+                self.client,
+                spend_secret,
+                scan_secret,
+                &GetBalanceCtOptions {
+                    start_index: 0,
+                    known_spent_outpoints: self.extra_spent_outpoints.clone(),
+                },
+            )
+            .await?;
+
+            return Ok(CachedBalanceResultCt {
+                balance,
+                cache: CacheInfo::default(),
+            });
+        };
+
+        let cache = BalanceCache::new(store);
+        let id = wallet_id(scan_secret);
+        let (mut data, mut info) = self.open_cache(&cache, &id, force_full);
+
+        // Caller-supplied spends are a local fact the node cannot confirm, so
+        // new ones must be applied even when nothing else has changed.
+        let new_spends = self
+            .extra_spent_outpoints
+            .iter()
+            .any(|o| !data.spent_outpoints.contains(o));
+
+        // CacheOnly answers without contacting the node, for immediate display.
+        if self.recovery == RecoveryPolicy::CacheOnly && !info.rebuilt && !new_spends {
+            let utxos: Vec<UtxoCt> = data
+                .ct_utxos
+                .iter()
+                .map(|u| u.to_utxo())
+                .collect::<Result<_>>()?;
+
+            let total_balance = utxos
+                .iter()
+                .fold(0u64, |acc, u| acc.saturating_add(u.amount));
+
+            info.skipped_scan = true;
+            info.up_to_date = false;
+            info.note = Some(
+                "served from cache without contacting the node; may be stale".to_string(),
+            );
+
+            return Ok(CachedBalanceResultCt {
+                balance: BalanceResultCt {
+                    total_balance,
+                    utxos,
+                    last_processed_index: data.ct_last_processed_index,
+                    total_outputs_scanned: 0,
+                    owned_outputs_found: 0,
+                },
+                cache: info,
+            });
+        }
+
+        let tip = self.client.get_blockchain_info().await?.blocks;
+        let chain_moved = tip == 0 || tip != data.ct_scanned_at_height;
+
+        let mut spent: HashSet<String> = data.spent_outpoints.iter().cloned().collect();
+        spent.extend(self.extra_spent_outpoints.iter().cloned());
+
+        let mut surviving = std::mem::take(&mut data.ct_utxos);
+        if let Some(bad) = surviving.iter().find(|u| u.to_utxo().is_err()) {
+            let reason = format!(
+                "cached CT UTXO {} did not decode, rebuilding from the node",
+                bad.outpoint()
+            );
+
+            surviving.clear();
+            data.ct_last_processed_index = 0;
+            info.loaded = 0;
+            info.rebuilt = true;
+            info.note = Some(reason);
+        }
+
+        let before = surviving.len();
+        surviving.retain(|u| !spent.contains(&u.outpoint()));
+        info.dropped += before - surviving.len();
+
+        let mut fresh: Vec<CachedUtxoCt> = Vec::new();
+        let mut total_outputs_scanned = 0usize;
+        let mut owned_outputs_found = 0usize;
+        let mut scanned_to = data.ct_last_processed_index;
+
+        // New CT outputs can only arrive in new blocks, so an unmoved tip means
+        // the walk cannot find anything.
+        info.skipped_scan = !chain_moved && !info.rebuilt;
+        info.up_to_date = info.skipped_scan;
+
+        if info.skipped_scan {
+            info.note = Some(format!(
+                "chain tip is unchanged at height {tip}; no records were fetched"
+            ));
+        } else {
+            let resume_from = if force_full {
+                0
+            } else {
+                self.recovery.resume_index(data.ct_last_processed_index)
+            };
+            info.resumed_from = Some(resume_from);
+
+            let result = get_balance_ct_with_callback(
+                self.client,
+                spend_secret,
+                scan_secret,
+                &GetBalanceCtOptions {
+                    start_index: resume_from,
+                    known_spent_outpoints: spent.clone(),
+                },
+                |page| fresh.extend(page.iter().map(CachedUtxoCt::from_parsed)),
+            )
+            .await?;
+
+            total_outputs_scanned = result.total_outputs_scanned;
+            owned_outputs_found = result.owned_outputs_found;
+            scanned_to = result
+                .last_processed_index
+                .max(data.ct_last_processed_index);
+            info.up_to_date = true;
+        }
+
+        let mut seen: HashSet<String> = surviving.iter().map(|u| u.outpoint()).collect();
+        for utxo in fresh {
+            if seen.insert(utxo.outpoint()) {
+                surviving.push(utxo);
+            }
+        }
+
+        let utxos: Vec<UtxoCt> = surviving
+            .iter()
+            .map(|u| u.to_utxo())
+            .collect::<Result<_>>()?;
+
+        let total_balance = utxos
+            .iter()
+            .fold(0u64, |acc, u| acc.saturating_add(u.amount));
+
+        let last_processed_index = scanned_to;
+
+        data.ct_last_processed_index = last_processed_index;
+        data.ct_utxos = surviving;
+        data.spent_outpoints = spent.iter().cloned().collect();
+
+        // CT outputs have no key images to re-check, so a completed scan always
+        // leaves the cache current as of this tip.
+        data.ct_scanned_at_height = tip;
+
+        self.save_cache(&cache, &data, &mut info);
+
+        Ok(CachedBalanceResultCt {
+            balance: BalanceResultCt {
+                total_balance,
+                utxos,
+                last_processed_index,
+                total_outputs_scanned,
+                owned_outputs_found,
+            },
+            cache: info,
+        })
+    }
 }
 
 #[cfg(test)]

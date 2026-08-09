@@ -7,7 +7,9 @@
 //!   rather than freshly generated, so the transaction spends real coins.
 //! - The recipient address comes from the environment rather than a throwaway
 //!   generated address.
-//! - Input UTXOs are scanned from the node instead of being fabricated.
+//! - Input UTXOs are scanned from the node instead of being fabricated, and the
+//!   scan is cached: a later run resumes 20 records before where the last one
+//!   stopped rather than re-walking the whole wallet history.
 //! - Decoys are always fetched from the node. There is no mock-decoy fallback:
 //!   a failed fetch is retried with backoff, and if it still fails the example
 //!   stops rather than building a transaction the network would reject.
@@ -28,6 +30,7 @@
 //! VEIL_NODE_URL           optional  node URL, defaults to the public endpoint
 //! VEIL_NODE_USERNAME      optional  RPC user, for an authenticated node
 //! VEIL_NODE_PASSWORD      optional  RPC password, for an authenticated node
+//! VEIL_CACHE_PATH         optional  cache file, defaults to veil-balance-cache.redb
 //! VEIL_BROADCAST          optional  set to 1 to actually broadcast the tx
 //! ```
 //!
@@ -48,18 +51,20 @@
 //! Scanning for UTXOs uses `getwatchonlytxes`, which sends the scan *private*
 //! key to the node; the node can then link every output belonging to this
 //! wallet. Point `VEIL_NODE_URL` at a node you control if that matters.
+//!
+//! The cache file holds decoded UTXOs, including amounts and blinding factors,
+//! so treat it as wallet data. It never stores the scan or spend secret.
 
 use std::collections::HashSet;
 use std::future::Future;
 use std::time::Duration;
 
-use veilrustlib::balance::{get_balance, GetBalanceOptions};
+use veilrustlib::balance::BalanceScanner;
+use veilrustlib::cache::{RecoveryPolicy, RedbStore};
 use veilrustlib::hdwallet::{derive_stealth_keys, verify_mnemonic_shape, AccountType, StealthKeys};
 use veilrustlib::rpc::{fetch_decoy_outputs, RpcClient};
 use veilrustlib::stealth::{validate_address, AddressValidation};
-use veilrustlib::transaction_builder::{
-    Recipient, TransactionBuilder, TransactionBuilderConfig, DEFAULT_FEE_PER_KB,
-};
+use veilrustlib::transaction_builder::{Recipient, TransactionBuilder, TransactionBuilderConfig};
 use veilrustlib::types::{AnonOutput, Utxo};
 use veilrustlib::utils::{bytes_to_hex, satoshis_to_veil, veil_to_satoshis};
 use veilrustlib::{VeilError, DEFAULT_RING_SIZE, MAX_ANON_INPUTS};
@@ -74,6 +79,14 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Ceiling on the backoff delay.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
+
+/// Records the cached scan rewinds before resuming.
+///
+/// Spending needs inputs that are genuinely unspent, so the walk re-reads the
+/// tail it already covered rather than trusting the stored resume point exactly.
+/// Cached key images are re-checked on every run regardless, which is what
+/// catches a spend already sitting in the mempool.
+const REWIND_RECORDS: u64 = 20;
 
 /// Read the seed phrase and derive the sender's stealth keys.
 ///
@@ -258,11 +271,29 @@ async fn run() -> Result<(), VeilError> {
     // Step 3 of the plan: real inputs, scanned from the node, instead of the
     // fabricated UTXOs the TypeScript example used.
     println!("4. Scanning for spendable UTXOs...");
-    let options = GetBalanceOptions::default();
-    let balance = with_retry("getbalance scan", || {
-        get_balance(&client, &keys.spend_secret, &keys.scan_secret, &options)
+
+    // The cache holds the UTXOs an earlier run already decoded, so only records
+    // after the stored resume point are fetched. `getwatchonlytxes` is the
+    // expensive call, and this is what avoids re-walking the whole history.
+    let cache_path = std::env::var("VEIL_CACHE_PATH")
+        .unwrap_or_else(|_| "veil-balance-cache.redb".to_string());
+
+    let (store, recreated) = RedbStore::open_or_recreate(&cache_path)?;
+    println!("   Cache:           {}", store.path().display());
+    if recreated {
+        println!("   The previous cache file was unreadable and has been recreated.");
+    }
+
+    let scanner = BalanceScanner::new(&client)
+        .with_cache(&store)
+        .with_recovery(RecoveryPolicy::Rewind(REWIND_RECORDS));
+
+    let scan = with_retry("getbalance scan", || {
+        scanner.balance(&keys.spend_secret, &keys.scan_secret)
     })
     .await?;
+
+    let balance = scan.balance;
 
     println!(
         "   Balance:         {} VEIL",
@@ -270,6 +301,22 @@ async fn run() -> Result<(), VeilError> {
     );
     println!("   Unspent UTXOs:   {}", balance.utxos.len());
     println!("   Outputs scanned: {}", balance.total_outputs_scanned);
+    println!(
+        "   From cache:      {} UTXOs, {} re-checked, {} newly spent",
+        scan.cache.loaded, scan.cache.revalidated, scan.cache.dropped
+    );
+
+    match scan.cache.resumed_from {
+        Some(index) => println!(
+            "   Resumed at:      record {index} (rewound {REWIND_RECORDS} from {})",
+            balance.last_processed_index
+        ),
+        None => println!("   Resumed at:      no walk needed, chain tip unchanged"),
+    }
+
+    if let Some(note) = &scan.cache.note {
+        println!("   Note:            {note}");
+    }
 
     // A ring cannot be built for an output whose global index is unknown, so
     // those UTXOs are not spendable here even though they hold value.
@@ -346,7 +393,7 @@ async fn run() -> Result<(), VeilError> {
 
     let builder = TransactionBuilder::new(TransactionBuilderConfig {
         ring_size,
-        fee_per_kb: 10000_0, // 0.001 veil or use DEFAULT_FEE_PER_KB
+        fee_per_kb: 100_000, // 0.001 VEIL; or use DEFAULT_FEE_PER_KB
     })?;
 
     println!("   {}", builder.describe_health(&spendable));

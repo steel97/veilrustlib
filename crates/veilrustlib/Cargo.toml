@@ -24,10 +24,14 @@ reqwest = { version = "0.12.15", default-features = false, features = [
 ], optional = true }
 base64 = { version = "0.22.1", optional = true }
 tokio = { version = "1.44.2", features = ["time"], optional = true }
+redb = { version = "4.1.0", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
 
 [features]
-default = ["rpc"]
+default = ["rpc", "cache-redb"]
 rpc = ["reqwest", "base64", "tokio"]
+# Single-file, pure-Rust persistent balance cache. Leave this off for targets
+# with no filesystem, such as wasm, where MemoryStore is used instead.
+cache-redb = ["redb", "rpc"]

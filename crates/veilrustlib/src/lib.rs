@@ -102,6 +102,8 @@ pub mod watch_only_tx;
 #[cfg(feature = "rpc")]
 pub mod balance;
 #[cfg(feature = "rpc")]
+pub mod cache;
+#[cfg(feature = "rpc")]
 pub mod rpc;
 
 // Re-export the most commonly used items.
@@ -130,7 +132,16 @@ pub use utils::{
 };
 
 #[cfg(feature = "rpc")]
+pub use balance::{BalanceScanner, CachedBalanceResult, CachedBalanceResultCt};
+#[cfg(feature = "rpc")]
+pub use cache::{
+    BalanceCache, CacheInfo, CacheLoad, CacheStore, MemoryStore, RecoveryPolicy, WalletCacheData,
+};
+#[cfg(feature = "rpc")]
 pub use rpc::{RpcClient, RpcConfig};
+
+#[cfg(all(feature = "rpc", feature = "cache-redb"))]
+pub use cache::RedbStore;
 
 #[cfg(test)]
 mod tests {

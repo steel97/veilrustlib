@@ -166,6 +166,7 @@ impl RpcClient {
             "method": method,
             "params": params,
         });
+        //println!("sending request to method {} {}", method, params);
 
         let mut builder = self.http.post(&self.config.url).json(&request);
 
@@ -201,7 +202,9 @@ impl RpcClient {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
-            return Err(VeilError::rpc(format!("{method} failed ({code}): {message}")));
+            return Err(VeilError::rpc(format!(
+                "{method} failed ({code}): {message}"
+            )));
         }
 
         body.get("result")
@@ -248,10 +251,7 @@ impl RpcClient {
                 pubkey: hex_to_array(pubkey_hex)?,
                 commitment: hex_to_array(commitment_hex)?,
                 index,
-                txid: item
-                    .get("txid")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                txid: item.get("txid").and_then(Value::as_str).map(str::to_owned),
                 vout: item
                     .get("vout")
                     .and_then(Value::as_u64)
@@ -300,11 +300,7 @@ impl RpcClient {
                     key_image,
                     valid,
                     msg: item.get("msg").and_then(Value::as_str).map(str::to_owned),
-                    spent: valid
-                        && item
-                            .get("spent")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
+                    spent: valid && item.get("spent").and_then(Value::as_bool).unwrap_or(false),
                     spent_in_mempool: valid
                         && item
                             .get("spentinmempool")
