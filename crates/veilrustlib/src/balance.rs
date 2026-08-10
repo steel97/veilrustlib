@@ -11,11 +11,11 @@
 
 use crate::cache::{
     wallet_id, BalanceCache, CacheInfo, CacheLoad, CacheStore, CachedUtxo, CachedUtxoCt,
-    RecoveryPolicy, WalletCacheData,
+    RecoveryPolicy, SentCache, SentTransaction, WalletCacheData,
 };
 use crate::error::{Result, VeilError};
 use crate::rpc::RpcClient;
-use crate::types::{KeyImage, SecretKey, Utxo, UtxoCt};
+use crate::types::{KeyImage, SecretKey, TxDirection, Utxo, UtxoCt};
 use crate::utils::bytes_to_hex;
 use crate::watch_only_tx::{
     parse_watch_only_transactions, parse_watch_only_transactions_ct, ParsedUtxo, ParsedUtxoCt,
@@ -131,6 +131,78 @@ async fn check_key_images_spent_status(
     Ok(())
 }
 
+/// Hex-encode a key image into a caller-supplied buffer.
+///
+/// The spent set is keyed by hex string, so every membership test needs the hex
+/// form of a key image. Allocating a `String` per test costs one allocation per
+/// UTXO per pass, and the spent check runs three times per scan. Writing into a
+/// reused stack buffer removes all of them while leaving the set's key type, and
+/// therefore the spend-detection logic, untouched.
+fn key_image_hex_in<'a>(key_image: &KeyImage, buf: &'a mut [u8; 66]) -> &'a str {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    for (i, byte) in key_image.iter().enumerate() {
+        buf[i * 2] = HEX[usize::from(byte >> 4)];
+        buf[i * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+    }
+
+    std::str::from_utf8(buf).expect("hex digits are always valid UTF-8")
+}
+
+/// A cached output that can be labelled with where it came from.
+///
+/// Exists so the two scan paths share one labelling implementation instead of
+/// carrying a copy each, which is how the RingCT and CT rules would drift apart.
+trait Directional {
+    /// The transaction that created this output, as a raw hash.
+    fn txid(&self) -> &[u8; 32];
+    /// Record where the output came from.
+    fn set_direction(&mut self, direction: TxDirection);
+}
+
+impl Directional for CachedUtxo {
+    fn txid(&self) -> &[u8; 32] {
+        &self.txid
+    }
+
+    fn set_direction(&mut self, direction: TxDirection) {
+        self.direction = direction;
+    }
+}
+
+impl Directional for CachedUtxoCt {
+    fn txid(&self) -> &[u8; 32] {
+        &self.txid
+    }
+
+    fn set_direction(&mut self, direction: TxDirection) {
+        self.direction = direction;
+    }
+}
+
+/// Label each output as change or incoming, given the wallet's send history.
+///
+/// This is the one place the two cache layers meet. An output whose transaction
+/// the wallet broadcast is change; anything else in a wallet with a known history
+/// arrived from elsewhere. Callers pass `None` when no history exists, which
+/// leaves every direction untouched at [`TxDirection::Unknown`], because a wallet
+/// that cannot remember what it sent cannot honestly call anything received.
+fn label_directions<T: Directional>(utxos: &mut [T], sent: Option<&HashSet<[u8; 32]>>) {
+    let Some(sent) = sent else {
+        return;
+    };
+
+    for utxo in utxos {
+        let direction = if sent.contains(utxo.txid()) {
+            TxDirection::Send
+        } else {
+            TxDirection::Receive
+        };
+
+        utxo.set_direction(direction);
+    }
+}
+
 /// Drop spent RingCT UTXOs and convert the rest into [`Utxo`] values.
 fn filter_unspent(
     parsed: Vec<ParsedUtxo>,
@@ -155,6 +227,7 @@ fn filter_unspent(
             block_height: 0, // Not reported by getwatchonlytxes.
             spendable: true,
             ringct_index: utxo.ringct_index,
+            direction: TxDirection::Unknown,
         });
         unspent_parsed.push(utxo);
     }
@@ -186,6 +259,7 @@ fn filter_unspent_ct(
             pubkey: utxo.pubkey,
             block_height: 0,
             spendable: true,
+            direction: TxDirection::Unknown,
         });
         unspent_parsed.push(utxo);
     }
@@ -512,6 +586,102 @@ impl<'a> BalanceScanner<'a> {
         self
     }
 
+    // -----------------------------------------------------------------------
+    // Sent-transaction history
+    // -----------------------------------------------------------------------
+
+    /// Record that this wallet successfully broadcast `txid`.
+    ///
+    /// Call this after `sendrawtransaction` returns. The recorded history is
+    /// what lets a later scan label change as [`TxDirection::Send`] instead of
+    /// [`TxDirection::Unknown`].
+    ///
+    /// Does nothing when no cache is configured, since there is nowhere to keep
+    /// the record. A store that cannot be written returns an error, but callers
+    /// should treat it as non-fatal: the transaction is already broadcast, and
+    /// the only loss is direction labelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VeilError::Cache`] when `txid` is not 64 hex characters, since
+    /// a record filed under a mangled id would never match a scanned output.
+    pub fn record_sent(&self, scan_secret: &SecretKey, txid: &str) -> Result<()> {
+        let Some(store) = self.store else {
+            return Ok(());
+        };
+
+        // The txid arrives as the hex string the node returned, and is stored as
+        // the 32 bytes it spells. This is the same encoding CachedUtxo uses, so
+        // the two sides compare directly during direction labelling.
+        let hash = crate::utils::hex_to_array::<32>(txid)
+            .map_err(|e| VeilError::cache(format!("sent txid {txid:?} is not 32 bytes of hex: {e}")))?;
+
+        SentCache::new(store).record(&wallet_id(scan_secret), &SentTransaction::new(hash))
+    }
+
+    /// Broadcast `tx_hex` and record it as sent if the node accepts it.
+    ///
+    /// The order matters and is deliberate: the transaction is broadcast first,
+    /// and only a txid the node actually returned is recorded. Recording first
+    /// would claim a send that may never have happened.
+    ///
+    /// A failed cache write does not fail the broadcast. The transaction is
+    /// already irreversibly on the network at that point, so reporting an error
+    /// would invite a caller to retry and pay twice. The lost record only means
+    /// the resulting change shows as [`TxDirection::Unknown`].
+    ///
+    /// Returns the txid the node reported.
+    pub async fn broadcast_and_record(
+        &self,
+        scan_secret: &SecretKey,
+        tx_hex: &str,
+    ) -> Result<String> {
+        let txid = self.client.send_raw_transaction(tx_hex).await?;
+
+        // Deliberately ignored: see the note above on why this cannot fail the
+        // call.
+        let _ = self.record_sent(scan_secret, &txid);
+
+        Ok(txid)
+    }
+
+    /// Read this wallet's sent-transaction history.
+    ///
+    /// Empty when no cache is configured or nothing has been recorded.
+    pub fn sent_transactions(&self, scan_secret: &SecretKey) -> Vec<SentTransaction> {
+        match self.store {
+            Some(store) => SentCache::new(store).load(&wallet_id(scan_secret)).unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Forget this wallet's sent-transaction history.
+    ///
+    /// Directions fall back to [`TxDirection::Unknown`] on the next scan, since
+    /// the wallet no longer has anything to compare against.
+    pub fn clear_sent(&self, scan_secret: &SecretKey) -> Result<()> {
+        match self.store {
+            Some(store) => SentCache::new(store).clear(&wallet_id(scan_secret)),
+            None => Ok(()),
+        }
+    }
+
+    /// The set of txids this wallet has sent, for direction labelling.
+    ///
+    /// Returns `None` when no history is available at all, which is the case
+    /// that must stay [`TxDirection::Unknown`]: an empty history and an absent
+    /// one are different claims. An empty recorded history means "this wallet
+    /// has sent nothing", so everything it owns was received. An absent one
+    /// means nothing is known either way.
+    fn sent_txids(&self, scan_secret: &SecretKey) -> Option<HashSet<[u8; 32]>> {
+        let store = self.store?;
+        let history = SentCache::new(store).load(&wallet_id(scan_secret))?;
+
+        // An empty cache is still a usable history: it means this wallet has been
+        // used but has never sent a transaction, so every owned output was received.
+        Some(history.into_iter().map(|tx| tx.txid).collect())
+    }
+
     /// Fetch the RingCT balance, using and updating the cache.
     pub async fn balance(
         &self,
@@ -770,8 +940,9 @@ impl<'a> BalanceScanner<'a> {
         }
 
         // Entries already known to be spent never needed re-checking.
+        let mut hex_buf = [0u8; 66];
         let before = surviving.len();
-        surviving.retain(|u| !spent.contains(&u.key_image));
+        surviving.retain(|u| !spent.contains(key_image_hex_in(&u.key_image, &mut hex_buf)));
         info.dropped += before - surviving.len();
 
         // Re-check every cached key image. This is scoped to the wallet's own
@@ -787,13 +958,14 @@ impl<'a> BalanceScanner<'a> {
             let key_images: Vec<KeyImage> = surviving
                 .iter()
                 .map(|u| u.key_image_bytes())
-                .collect::<Result<_>>()?;
+                .collect();
 
             check_key_images_spent_status(self.client, &key_images, &mut spent, batch_size).await?;
             info.revalidated = surviving.len();
 
+            let mut hex_buf = [0u8; 66];
             let before = surviving.len();
-            surviving.retain(|u| !spent.contains(&u.key_image));
+            surviving.retain(|u| !spent.contains(key_image_hex_in(&u.key_image, &mut hex_buf)));
             info.dropped += before - surviving.len();
         }
 
@@ -802,6 +974,10 @@ impl<'a> BalanceScanner<'a> {
         // moved, since `getwatchonlytxes` is the expensive call and no new
         // records can exist.
         let mut fresh: Vec<CachedUtxo> = Vec::new();
+        // The page callback cannot return an error, so a malformed txid is held
+        // here and raised once the walk finishes. Skipping the entry instead
+        // would silently drop a spendable output from the balance.
+        let mut convert_error: Option<VeilError> = None;
         let mut total_outputs_scanned = 0usize;
         let mut owned_outputs_found = 0usize;
         let mut scanned_to = data.last_processed_index;
@@ -828,9 +1004,22 @@ impl<'a> BalanceScanner<'a> {
                 spend_secret,
                 scan_secret,
                 &self.options(resume_from, spent.clone()),
-                |page| fresh.extend(page.iter().map(CachedUtxo::from_parsed)),
+                |page| {
+                    for parsed in page {
+                        match CachedUtxo::from_parsed(parsed) {
+                            Ok(utxo) => fresh.push(utxo),
+                            Err(e) => {
+                                convert_error.get_or_insert(e);
+                            }
+                        }
+                    }
+                },
             )
             .await?;
+
+            if let Some(e) = convert_error {
+                return Err(e);
+            }
 
             spent.extend(result.spent_key_images.iter().cloned());
             total_outputs_scanned = result.total_outputs_scanned;
@@ -852,7 +1041,16 @@ impl<'a> BalanceScanner<'a> {
         }
 
         // The scan may have learned about spends affecting cached entries.
-        surviving.retain(|u| !spent.contains(&u.key_image));
+        let mut hex_buf = [0u8; 66];
+        surviving.retain(|u| !spent.contains(key_image_hex_in(&u.key_image, &mut hex_buf)));
+
+        // Label each output against the wallet's own send history. This is the
+        // only place the two cache layers meet: an output whose transaction the
+        // wallet broadcast is change, anything else in a wallet with a known
+        // history was received, and a wallet with no history at all stays
+        // Unknown.
+        let sent = self.sent_txids(scan_secret);
+        label_directions(&mut surviving, sent.as_ref());
 
         let utxos: Vec<Utxo> = surviving
             .iter()
@@ -999,6 +1197,9 @@ impl<'a> BalanceScanner<'a> {
         info.dropped += before - surviving.len();
 
         let mut fresh: Vec<CachedUtxoCt> = Vec::new();
+        // As in the RingCT path: the callback cannot fail, so a malformed txid is
+        // held and raised after the walk rather than dropping the output.
+        let mut convert_error: Option<VeilError> = None;
         let mut total_outputs_scanned = 0usize;
         let mut owned_outputs_found = 0usize;
         let mut scanned_to = data.ct_last_processed_index;
@@ -1028,9 +1229,22 @@ impl<'a> BalanceScanner<'a> {
                     start_index: resume_from,
                     known_spent_outpoints: spent.clone(),
                 },
-                |page| fresh.extend(page.iter().map(CachedUtxoCt::from_parsed)),
+                |page| {
+                    for parsed in page {
+                        match CachedUtxoCt::from_parsed(parsed) {
+                            Ok(utxo) => fresh.push(utxo),
+                            Err(e) => {
+                                convert_error.get_or_insert(e);
+                            }
+                        }
+                    }
+                },
             )
             .await?;
+
+            if let Some(e) = convert_error {
+                return Err(e);
+            }
 
             total_outputs_scanned = result.total_outputs_scanned;
             owned_outputs_found = result.owned_outputs_found;
@@ -1046,6 +1260,10 @@ impl<'a> BalanceScanner<'a> {
                 surviving.push(utxo);
             }
         }
+
+        // Label each output against the wallet's own send history.
+        let sent = self.sent_txids(scan_secret);
+        label_directions(&mut surviving, sent.as_ref());
 
         let utxos: Vec<UtxoCt> = surviving
             .iter()

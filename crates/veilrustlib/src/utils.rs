@@ -41,6 +41,17 @@ pub fn hex_to_array<const N: usize>(hex: &str) -> Result<[u8; N]> {
     })
 }
 
+/// Decode a 64-character hex string into a 32-byte hash.
+///
+/// Transaction IDs from the node are in display order (byte-reversed).
+///
+/// # Errors
+///
+/// Returns [`VeilError::InvalidInput`] when the string is not exactly 64 hex chars.
+pub fn hex_to_hash(hex: &str) -> Result<[u8; 32]> {
+    hex_to_array::<32>(hex)
+}
+
 /// Copy a slice into a fixed-size array.
 ///
 /// # Errors

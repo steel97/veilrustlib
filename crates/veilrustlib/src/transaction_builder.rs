@@ -1467,6 +1467,7 @@ mod tests {
             block_height: 1,
             spendable: true,
             ringct_index: Some(ringct_index),
+            direction: crate::types::TxDirection::Unknown,
         }
     }
 

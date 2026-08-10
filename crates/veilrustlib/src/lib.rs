@@ -148,8 +148,8 @@ pub mod rpc;
 pub use error::{Result, VeilError};
 pub use types::{
     AnonOutput, Balance, Blind, Commitment, DataOutputType, Hash, KeyImage, OutPoint, OutputType,
-    PublicKey, RangeProof, SecretKey, Transaction, TransactionType, TxInput, TxInputCt, TxOutput,
-    Utxo, UtxoCt, ANON_MARKER, MAX_MONEY, SATOSHIS_PER_VEIL,
+    PublicKey, RangeProof, SecretKey, Transaction, TransactionType, TxDirection, TxInput, TxInputCt,
+    TxOutput, Utxo, UtxoCt, ANON_MARKER, MAX_MONEY, SATOSHIS_PER_VEIL,
 };
 
 pub use buffer_reader::BufferReader;
@@ -177,7 +177,8 @@ pub use utils::{
 pub use balance::{BalanceScanner, CachedBalanceResult, CachedBalanceResultCt};
 #[cfg(feature = "rpc")]
 pub use cache::{
-    BalanceCache, CacheInfo, CacheLoad, CacheStore, MemoryStore, RecoveryPolicy, WalletCacheData,
+    BalanceCache, CacheInfo, CacheLoad, CacheStore, MemoryStore, RecoveryPolicy, SentCache,
+    SentTransaction, WalletCacheData,
 };
 #[cfg(feature = "rpc")]
 pub use rpc::{RpcClient, RpcConfig};

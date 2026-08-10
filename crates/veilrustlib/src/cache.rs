@@ -16,6 +16,28 @@
 //!   without file access (wasm) do not have to compile it.
 //! - [`BalanceCache`] sits on top of a store and handles framing, integrity
 //!   checking, and schema versioning.
+//! - [`SentCache`] is a second layer in the same store, recording the
+//!   transactions this wallet successfully broadcast.
+//!
+//! ## Two layers, one store
+//!
+//! Balance records answer "what do I own". They cannot answer "where did it come
+//! from": an output the wallet created as change and an output someone paid it
+//! are both just owned outputs in the watch-only stream. [`SentCache`] keeps the
+//! missing half, a list of transactions this wallet sent, under its own key
+//! prefix in the same store. Comparing the two is what lets a UTXO be labelled
+//! [`crate::types::TxDirection::Send`] or
+//! [`crate::types::TxDirection::Receive`] instead of
+//! [`crate::types::TxDirection::Unknown`].
+//!
+//! ## Binary payloads
+//!
+//! Records are written with a hand-rolled little-endian codec rather than JSON.
+//! Keys, commitments, and blinds are fixed-length byte arrays, so JSON spent
+//! two hex characters plus quoting and field names on every byte of them. The
+//! codec writes them raw, which cuts a typical record to roughly a third of its
+//! JSON size and removes hex parsing from the read path entirely: a field that
+//! decodes at all is already the right length.
 //!
 //! ## Corruption is expected, not exceptional
 //!
@@ -43,20 +65,32 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
 use crate::error::{Result, VeilError};
-use crate::types::{KeyImage, SecretKey, Utxo, UtxoCt};
-use crate::utils::{bytes_to_hex, hex_to_bytes};
+use crate::types::{KeyImage, SecretKey, TxDirection, Utxo, UtxoCt};
+use crate::utils::bytes_to_hex;
 use crate::watch_only_tx::{ParsedUtxo, ParsedUtxoCt};
+
+use sha2::{Digest, Sha256};
 
 /// Schema version of the cached payload.
 ///
 /// Bump this whenever [`WalletCacheData`] changes in a way older readers cannot
 /// understand. Records written by a different version are reported as
 /// [`CacheLoad::Stale`] and rebuilt from the node instead of being decoded.
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+///
+/// ## Version history
+///
+/// - **v1**: JSON-encoded payloads, no direction field, no binary codec.
+/// - **v2**: Binary codec, TxDirection added to UTXOs.
+/// - **v3**: Transaction IDs stored as 32 raw bytes instead of a length-prefixed
+///   64-character hex string. The field width changed, so a v2 reader and a v3
+///   reader disagree about every offset after the first txid; the bump is what
+///   makes an older record report as [`CacheLoad::Stale`] and get rebuilt rather
+///   than decode into plausible nonsense.
+///
+/// Only the newest version is readable. The cache is derived data, so a version
+/// mismatch costs one rescan and nothing else.
+pub const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Records [`RecoveryPolicy::default`] rewinds before resuming a scan.
 ///
@@ -303,63 +337,125 @@ pub use redb_store::RedbStore;
 // Cached records
 // ---------------------------------------------------------------------------
 
-/// A cached RingCT UTXO.
+/// Decode a display-order transaction ID into the 32 bytes the cache stores.
 ///
-/// Byte fields are stored as hex rather than raw arrays: `serde` has no
-/// implementations for arrays longer than 32 bytes, and a textual form stays
-/// readable and stable across schema versions.
+/// ## Byte order
+///
+/// The bytes are stored exactly as the display hex spells them, not reversed
+/// into the internal consensus order. That keeps the cache a pure re-encoding of
+/// the string it replaces: `parse_txid` then [`bytes_to_hex`] returns the
+/// original txid unchanged, so nothing downstream has to know the cache switched
+/// representations. Reversing here would silently flip every txid a caller reads
+/// back out.
+///
+/// # Errors
+///
+/// Returns [`VeilError::Cache`] when `txid` is not exactly 64 hex characters.
+fn parse_txid(txid: &str) -> Result<[u8; 32]> {
+    crate::utils::hex_to_array::<32>(txid)
+        .map_err(|e| VeilError::cache(format!("txid {txid:?} is not 32 bytes of hex: {e}")))
+}
+
+/// A cached RingCT UTXO, stored in binary format.
 ///
 /// Unlike [`Utxo`] this keeps the key image, which is what makes it possible to
 /// re-check a cached entry's spent status without re-parsing the record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedUtxo {
-    /// Transaction ID, in display order.
-    pub txid: String,
+    /// Transaction ID, in display (reversed) byte order.
+    pub txid: [u8; 32],
     /// Output index within the transaction.
     pub vout: u32,
     /// Amount in satoshis.
     pub amount: u64,
-    /// Pedersen commitment, hex-encoded.
-    pub commitment: String,
-    /// Blinding factor, hex-encoded.
-    pub blind: String,
-    /// One-time destination public key, hex-encoded.
-    pub pubkey: String,
-    /// Ephemeral public key, hex-encoded.
-    pub ephemeral_pubkey: String,
-    /// Key image, hex-encoded.
-    pub key_image: String,
+    /// Pedersen commitment.
+    pub commitment: [u8; 33],
+    /// Blinding factor.
+    pub blind: [u8; 32],
+    /// One-time destination public key.
+    pub pubkey: [u8; 33],
+    /// Ephemeral public key.
+    pub ephemeral_pubkey: [u8; 33],
+    /// Key image.
+    pub key_image: [u8; 33],
     /// Global RingCT index.
     pub ringct_index: Option<u64>,
+    /// Direction: send, receive, or unknown.
+    pub direction: TxDirection,
 }
 
 impl CachedUtxo {
-    /// Capture a freshly parsed UTXO for storage.
-    pub fn from_parsed(utxo: &ParsedUtxo) -> Self {
-        Self {
-            txid: utxo.txid.clone(),
+    /// Capture a freshly parsed UTXO for storage, with the origin still unknown.
+    ///
+    /// A parse alone cannot say where an output came from, so this is the honest
+    /// default. Use [`Self::from_parsed_with_direction`] when the sent-
+    /// transaction history has already been consulted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VeilError::Cache`] when [`ParsedUtxo::txid`] is not 64 hex
+    /// characters. The parser always produces that, but the field is public, so
+    /// this cannot be an assertion.
+    pub fn from_parsed(utxo: &ParsedUtxo) -> Result<Self> {
+        Self::from_parsed_with_direction(utxo, TxDirection::Unknown)
+    }
+
+    /// Capture a freshly parsed UTXO, labelling where it came from.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_parsed`].
+    pub fn from_parsed_with_direction(
+        utxo: &ParsedUtxo,
+        direction: TxDirection,
+    ) -> Result<Self> {
+        Ok(Self {
+            txid: parse_txid(&utxo.txid)?,
             vout: utxo.vout,
             amount: utxo.amount,
-            commitment: bytes_to_hex(&utxo.commitment),
-            blind: bytes_to_hex(&utxo.blind),
-            pubkey: bytes_to_hex(&utxo.pubkey),
-            ephemeral_pubkey: bytes_to_hex(&utxo.ephemeral_pubkey),
-            key_image: bytes_to_hex(&utxo.key_image),
+            commitment: utxo.commitment,
+            blind: utxo.blind,
+            pubkey: utxo.pubkey,
+            ephemeral_pubkey: utxo.ephemeral_pubkey,
+            key_image: utxo.key_image,
             ringct_index: utxo.ringct_index,
+            direction,
+        })
+    }
+
+    /// Rebuild the parsed form, for callers that want key images back.
+    pub fn to_parsed(&self) -> ParsedUtxo {
+        ParsedUtxo {
+            txid: bytes_to_hex(&self.txid),
+            vout: self.vout,
+            amount: self.amount,
+            commitment: self.commitment,
+            blind: self.blind,
+            pubkey: self.pubkey,
+            ephemeral_pubkey: self.ephemeral_pubkey,
+            key_image: self.key_image,
+            ringct_index: self.ringct_index,
         }
+    }
+
+    /// The key image, hex-encoded, as the spent-set uses it.
+    pub fn key_image_hex(&self) -> String {
+        bytes_to_hex(&self.key_image)
     }
 
     /// Outpoint identity, `txid:vout`, used to deduplicate entries.
     pub fn outpoint(&self) -> String {
-        format!("{}:{}", self.txid, self.vout)
+        format!("{}:{}", bytes_to_hex(&self.txid), self.vout)
     }
 
-    /// The key image as bytes.
-    ///
-    /// Fails when the stored hex is not a valid 33-byte key image, which means
-    /// the record is corrupt.
-    pub fn key_image_bytes(&self) -> Result<KeyImage> {
-        hex_array::<33>("key_image", &self.key_image)
+    /// Transaction ID as hex string, in display order.
+    pub fn txid_hex(&self) -> String {
+        bytes_to_hex(&self.txid)
+    }
+
+    /// The key image as a byte array.
+    pub fn key_image_bytes(&self) -> KeyImage {
+        self.key_image
     }
 
     /// Rebuild the spendable [`Utxo`].
@@ -367,91 +463,103 @@ impl CachedUtxo {
     /// `block_height` is zero because `getwatchonlytxes` never reported it.
     pub fn to_utxo(&self) -> Result<Utxo> {
         Ok(Utxo {
-            txid: self.txid.clone(),
+            txid: bytes_to_hex(&self.txid),
             vout: self.vout,
             amount: self.amount,
-            commitment: hex_array::<33>("commitment", &self.commitment)?,
-            blind: hex_array::<32>("blind", &self.blind)?,
-            pubkey: hex_array::<33>("pubkey", &self.pubkey)?,
-            ephemeral_pubkey: hex_array::<33>("ephemeral_pubkey", &self.ephemeral_pubkey)?,
+            commitment: self.commitment,
+            blind: self.blind,
+            pubkey: self.pubkey,
+            ephemeral_pubkey: self.ephemeral_pubkey,
             block_height: 0,
             spendable: true,
             ringct_index: self.ringct_index,
-        })
-    }
-
-    /// Rebuild the parsed form, for callers that want key images back.
-    pub fn to_parsed(&self) -> Result<ParsedUtxo> {
-        Ok(ParsedUtxo {
-            txid: self.txid.clone(),
-            vout: self.vout,
-            amount: self.amount,
-            commitment: hex_array::<33>("commitment", &self.commitment)?,
-            blind: hex_array::<32>("blind", &self.blind)?,
-            pubkey: hex_array::<33>("pubkey", &self.pubkey)?,
-            ephemeral_pubkey: hex_array::<33>("ephemeral_pubkey", &self.ephemeral_pubkey)?,
-            key_image: hex_array::<33>("key_image", &self.key_image)?,
-            ringct_index: self.ringct_index,
+            direction: self.direction,
         })
     }
 }
 
-/// A cached CT (stealth) UTXO.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A cached CT (stealth) UTXO, stored in binary format.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedUtxoCt {
-    /// Transaction ID, in display order.
-    pub txid: String,
+    /// Transaction ID, in display (reversed) byte order.
+    pub txid: [u8; 32],
     /// Output index within the transaction.
     pub vout: u32,
     /// Amount in satoshis.
     pub amount: u64,
-    /// Pedersen commitment, hex-encoded.
-    pub commitment: String,
-    /// Blinding factor, hex-encoded.
-    pub blind: String,
-    /// Script pubkey, hex-encoded.
-    pub script_pubkey: String,
-    /// Derived destination public key, hex-encoded.
-    pub pubkey: String,
-    /// Ephemeral public key, hex-encoded.
-    pub ephemeral_pubkey: String,
+    /// Pedersen commitment.
+    pub commitment: [u8; 33],
+    /// Blinding factor.
+    pub blind: [u8; 32],
+    /// Script pubkey.
+    pub script_pubkey: Vec<u8>,
+    /// Derived destination public key.
+    pub pubkey: [u8; 33],
+    /// Ephemeral public key.
+    pub ephemeral_pubkey: [u8; 33],
+    /// Direction: send, receive, or unknown.
+    pub direction: TxDirection,
 }
 
 impl CachedUtxoCt {
-    /// Capture a freshly parsed CT UTXO for storage.
-    pub fn from_parsed(utxo: &ParsedUtxoCt) -> Self {
-        Self {
-            txid: utxo.txid.clone(),
+    /// Capture a freshly parsed CT UTXO for storage, origin still unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VeilError::Cache`] when [`ParsedUtxoCt::txid`] is not 64 hex
+    /// characters.
+    pub fn from_parsed(utxo: &ParsedUtxoCt) -> Result<Self> {
+        Self::from_parsed_with_direction(utxo, TxDirection::Unknown)
+    }
+
+    /// Capture a freshly parsed CT UTXO, labelling where it came from.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_parsed`].
+    pub fn from_parsed_with_direction(
+        utxo: &ParsedUtxoCt,
+        direction: TxDirection,
+    ) -> Result<Self> {
+        Ok(Self {
+            txid: parse_txid(&utxo.txid)?,
             vout: utxo.vout,
             amount: utxo.amount,
-            commitment: bytes_to_hex(&utxo.commitment),
-            blind: bytes_to_hex(&utxo.blind),
-            script_pubkey: bytes_to_hex(&utxo.script_pubkey),
-            pubkey: bytes_to_hex(&utxo.pubkey),
-            ephemeral_pubkey: bytes_to_hex(&utxo.ephemeral_pubkey),
-        }
+            commitment: utxo.commitment,
+            blind: utxo.blind,
+            script_pubkey: utxo.script_pubkey.clone(),
+            pubkey: utxo.pubkey,
+            ephemeral_pubkey: utxo.ephemeral_pubkey,
+            direction,
+        })
     }
 
     /// Outpoint identity, `txid:vout`.
     ///
     /// CT outputs carry no key image, so this is also how spends are tracked.
     pub fn outpoint(&self) -> String {
-        format!("{}:{}", self.txid, self.vout)
+        format!("{}:{}", bytes_to_hex(&self.txid), self.vout)
+    }
+
+    /// Transaction ID as hex string, in display order.
+    pub fn txid_hex(&self) -> String {
+        bytes_to_hex(&self.txid)
     }
 
     /// Rebuild the spendable [`UtxoCt`].
     pub fn to_utxo(&self) -> Result<UtxoCt> {
         Ok(UtxoCt {
-            txid: self.txid.clone(),
+            txid: bytes_to_hex(&self.txid),
             vout: self.vout,
             amount: self.amount,
-            commitment: hex_array::<33>("commitment", &self.commitment)?,
-            blind: hex_array::<32>("blind", &self.blind)?,
-            script_pubkey: hex_to_bytes(&self.script_pubkey)?,
-            ephemeral_pubkey: hex_array::<33>("ephemeral_pubkey", &self.ephemeral_pubkey)?,
-            pubkey: hex_array::<33>("pubkey", &self.pubkey)?,
+            commitment: self.commitment,
+            blind: self.blind,
+            script_pubkey: self.script_pubkey.clone(),
+            ephemeral_pubkey: self.ephemeral_pubkey,
+            pubkey: self.pubkey,
             block_height: 0,
             spendable: true,
+            direction: self.direction,
         })
     }
 }
@@ -460,7 +568,7 @@ impl CachedUtxoCt {
 ///
 /// This is the resume state of a scan: where the last one stopped, what it
 /// found, and which outputs were known to be spent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalletCacheData {
     /// Wallet this record belongs to, from [`wallet_id`].
     pub wallet_id: String,
@@ -474,21 +582,27 @@ pub struct WalletCacheData {
     /// since this height there is nothing new to fetch and the expensive
     /// `getwatchonlytxes` walk can be skipped entirely. This is the single
     /// biggest saving the cache provides.
-    #[serde(default)]
     pub scanned_at_height: u64,
     /// Chain height at which the CT records were last walked.
     ///
     /// Tracked separately from [`Self::scanned_at_height`] because the RingCT
     /// and CT scans advance independently.
-    #[serde(default)]
     pub ct_scanned_at_height: u64,
     /// Unspent RingCT UTXOs as of the last scan.
     pub utxos: Vec<CachedUtxo>,
     /// Unspent CT UTXOs as of the last scan.
     pub ct_utxos: Vec<CachedUtxoCt>,
     /// Key images known to be spent, hex-encoded.
+    ///
+    /// Still hex rather than raw bytes, unlike the UTXO fields. The spent set is
+    /// hex all the way out through [`crate::balance::BalanceResult`] and the
+    /// node-facing options, so storing bytes here would mean a fallible
+    /// hex-to-bytes conversion on every save. A save that can fail on a
+    /// malformed string is a worse trade than the ~37 bytes per entry it saves.
     pub spent_key_images: Vec<String>,
     /// Outpoints known to be spent, formatted `txid:vout`.
+    ///
+    /// Hex for the same reason as [`Self::spent_key_images`].
     pub spent_outpoints: Vec<String>,
 }
 
@@ -672,6 +786,336 @@ pub struct CacheInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Binary codec
+// ---------------------------------------------------------------------------
+
+/// Write a variable-length byte slice: length as u32 LE, then the bytes.
+fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(data);
+}
+
+/// Write a string: length as u32 LE, then UTF-8 bytes.
+fn write_string(buf: &mut Vec<u8>, s: &str) {
+    write_bytes(buf, s.as_bytes());
+}
+
+/// Write an optional u64: 0x00 for None, 0x01 then u64 LE for Some.
+fn write_option_u64(buf: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        None => buf.push(0x00),
+        Some(v) => {
+            buf.push(0x01);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// Write a 32-byte hash directly, no length prefix.
+fn write_hash32(buf: &mut Vec<u8>, hash: &[u8; 32]) {
+    buf.extend_from_slice(hash);
+}
+
+/// Write a 33-byte key image or commitment directly, no length prefix.
+fn write_bytes33(buf: &mut Vec<u8>, data: &[u8; 33]) {
+    buf.extend_from_slice(data);
+}
+
+/// Largest single variable-length field the decoder will accept, in bytes.
+///
+/// The length prefix comes from the file, so it is untrusted: a corrupt record
+/// can claim up to 4 GiB and a decoder that believed it would allocate that
+/// much before discovering the data is not there. Nothing legitimate comes
+/// close. The largest variable field is a CT script pubkey, normally 25 bytes,
+/// and a txid string is 64.
+const MAX_FIELD_LEN: usize = 1024 * 1024;
+
+/// Largest element count the decoder will accept for any collection.
+///
+/// Bounds the same attack as [`MAX_FIELD_LEN`] one level up: a count is also
+/// read from the file, and every element costs at least one allocation.
+const MAX_COLLECTION_LEN: usize = 5_000_000;
+
+/// Take `n` bytes, refusing to read past the end.
+///
+/// Uses checked arithmetic throughout. `offset + n` can wrap on a 32-bit
+/// target, and a wrapped sum compares as smaller than the buffer, which is
+/// exactly the case that would turn a bounds check into an out-of-bounds read.
+fn take<'a>(data: &'a [u8], offset: &mut usize, n: usize) -> Result<&'a [u8]> {
+    let end = offset
+        .checked_add(n)
+        .ok_or_else(|| VeilError::cache("cache offset overflowed"))?;
+
+    if end > data.len() {
+        return Err(VeilError::cache(format!(
+            "truncated record: need {n} bytes at offset {offset}, {} remain",
+            data.len().saturating_sub(*offset)
+        )));
+    }
+
+    let slice = &data[*offset..end];
+    *offset = end;
+    Ok(slice)
+}
+
+/// Read a `u8`.
+fn read_u8(data: &[u8], offset: &mut usize) -> Result<u8> {
+    Ok(take(data, offset, 1)?[0])
+}
+
+/// Read a little-endian `u32`.
+fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32> {
+    let bytes = take(data, offset, 4)?;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().expect("take returned exactly 4 bytes"),
+    ))
+}
+
+/// Read a little-endian `u64`.
+fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64> {
+    let bytes = take(data, offset, 8)?;
+    Ok(u64::from_le_bytes(
+        bytes.try_into().expect("take returned exactly 8 bytes"),
+    ))
+}
+
+/// Read a length-prefixed byte slice, rejecting an implausible length.
+fn read_bytes(data: &[u8], offset: &mut usize) -> Result<Vec<u8>> {
+    let len = read_u32(data, offset)? as usize;
+
+    // Checked before allocating, so a corrupt length cannot be turned into a
+    // multi-gigabyte reservation.
+    if len > MAX_FIELD_LEN {
+        return Err(VeilError::cache(format!(
+            "cached field claims {len} bytes, above the {MAX_FIELD_LEN}-byte limit"
+        )));
+    }
+
+    Ok(take(data, offset, len)?.to_vec())
+}
+
+/// Read a length-prefixed UTF-8 string.
+fn read_string(data: &[u8], offset: &mut usize) -> Result<String> {
+    let bytes = read_bytes(data, offset)?;
+    String::from_utf8(bytes).map_err(|_| VeilError::cache("invalid UTF-8 in cached string"))
+}
+
+/// Read a fixed-size array.
+fn read_array<const N: usize>(data: &[u8], offset: &mut usize) -> Result<[u8; N]> {
+    let slice = take(data, offset, N)?;
+    Ok(slice.try_into().expect("take returned exactly N bytes"))
+}
+
+/// Read a 32-byte hash with no length prefix.
+fn read_hash32(data: &[u8], offset: &mut usize) -> Result<[u8; 32]> {
+    read_array::<32>(data, offset)
+}
+
+/// Read an element count, rejecting one too large to be real.
+///
+/// The returned value is also safe to use as an allocation hint, which is why
+/// the cap is applied here rather than at each call site.
+fn read_count(data: &[u8], offset: &mut usize, label: &str) -> Result<usize> {
+    let count = read_u32(data, offset)? as usize;
+
+    if count > MAX_COLLECTION_LEN {
+        return Err(VeilError::cache(format!(
+            "cached {label} count of {count} is above the {MAX_COLLECTION_LEN} limit"
+        )));
+    }
+
+    // A record cannot hold more elements than it has bytes remaining, so a
+    // count larger than that is corrupt no matter what the cap says. This also
+    // keeps the with_capacity below proportional to the real record size.
+    let remaining = data.len().saturating_sub(*offset);
+    if count > remaining {
+        return Err(VeilError::cache(format!(
+            "cached {label} count of {count} exceeds the {remaining} bytes remaining"
+        )));
+    }
+
+    Ok(count)
+}
+
+/// Read an optional u64.
+fn read_option_u64(data: &[u8], offset: &mut usize) -> Result<Option<u64>> {
+    match read_u8(data, offset)? {
+        0x00 => Ok(None),
+        0x01 => Ok(Some(read_u64(data, offset)?)),
+        tag => Err(VeilError::cache(format!(
+            "invalid option discriminant: {tag}"
+        ))),
+    }
+}
+
+/// Encode a [`CachedUtxo`] into binary.
+fn encode_cached_utxo(utxo: &CachedUtxo, buf: &mut Vec<u8>) {
+    write_hash32(buf, &utxo.txid);
+    buf.extend_from_slice(&utxo.vout.to_le_bytes());
+    buf.extend_from_slice(&utxo.amount.to_le_bytes());
+    write_bytes33(buf, &utxo.commitment);
+    buf.extend_from_slice(&utxo.blind);
+    write_bytes33(buf, &utxo.pubkey);
+    write_bytes33(buf, &utxo.ephemeral_pubkey);
+    write_bytes33(buf, &utxo.key_image);
+    write_option_u64(buf, utxo.ringct_index);
+    buf.push(utxo.direction.as_u8());
+}
+
+/// Decode a [`CachedUtxo`] from binary.
+fn decode_cached_utxo(data: &[u8], offset: &mut usize) -> Result<CachedUtxo> {
+    let txid = read_hash32(data, offset)?;
+    let vout = read_u32(data, offset)?;
+    let amount = read_u64(data, offset)?;
+    let commitment = read_array::<33>(data, offset)?;
+    let blind = read_array::<32>(data, offset)?;
+    let pubkey = read_array::<33>(data, offset)?;
+    let ephemeral_pubkey = read_array::<33>(data, offset)?;
+    let key_image = read_array::<33>(data, offset)?;
+    let ringct_index = read_option_u64(data, offset)?;
+    let direction = TxDirection::from_u8(read_u8(data, offset)?);
+
+    Ok(CachedUtxo {
+        txid,
+        vout,
+        amount,
+        commitment,
+        blind,
+        pubkey,
+        ephemeral_pubkey,
+        key_image,
+        ringct_index,
+        direction,
+    })
+}
+
+/// Encode a [`CachedUtxoCt`] into binary.
+fn encode_cached_utxo_ct(utxo: &CachedUtxoCt, buf: &mut Vec<u8>) {
+    write_hash32(buf, &utxo.txid);
+    buf.extend_from_slice(&utxo.vout.to_le_bytes());
+    buf.extend_from_slice(&utxo.amount.to_le_bytes());
+    write_bytes33(buf, &utxo.commitment);
+    buf.extend_from_slice(&utxo.blind);
+    write_bytes(buf, &utxo.script_pubkey);
+    write_bytes33(buf, &utxo.pubkey);
+    write_bytes33(buf, &utxo.ephemeral_pubkey);
+    buf.push(utxo.direction.as_u8());
+}
+
+/// Decode a [`CachedUtxoCt`] from binary.
+fn decode_cached_utxo_ct(data: &[u8], offset: &mut usize) -> Result<CachedUtxoCt> {
+    let txid = read_hash32(data, offset)?;
+    let vout = read_u32(data, offset)?;
+    let amount = read_u64(data, offset)?;
+    let commitment = read_array::<33>(data, offset)?;
+    let blind = read_array::<32>(data, offset)?;
+    let script_pubkey = read_bytes(data, offset)?;
+    let pubkey = read_array::<33>(data, offset)?;
+    let ephemeral_pubkey = read_array::<33>(data, offset)?;
+    let direction = TxDirection::from_u8(read_u8(data, offset)?);
+
+    Ok(CachedUtxoCt {
+        txid,
+        vout,
+        amount,
+        commitment,
+        blind,
+        script_pubkey,
+        pubkey,
+        ephemeral_pubkey,
+        direction,
+    })
+}
+
+/// Encode [`WalletCacheData`] into binary.
+fn encode_wallet_cache(data: &WalletCacheData) -> Vec<u8> {
+    let mut buf = Vec::new();
+    
+    write_string(&mut buf, &data.wallet_id);
+    buf.extend_from_slice(&data.last_processed_index.to_le_bytes());
+    buf.extend_from_slice(&data.ct_last_processed_index.to_le_bytes());
+    buf.extend_from_slice(&data.scanned_at_height.to_le_bytes());
+    buf.extend_from_slice(&data.ct_scanned_at_height.to_le_bytes());
+    
+    // RingCT UTXOs
+    buf.extend_from_slice(&(data.utxos.len() as u32).to_le_bytes());
+    for utxo in &data.utxos {
+        encode_cached_utxo(utxo, &mut buf);
+    }
+    
+    // CT UTXOs
+    buf.extend_from_slice(&(data.ct_utxos.len() as u32).to_le_bytes());
+    for utxo in &data.ct_utxos {
+        encode_cached_utxo_ct(utxo, &mut buf);
+    }
+    
+    // Spent key images
+    buf.extend_from_slice(&(data.spent_key_images.len() as u32).to_le_bytes());
+    for ki in &data.spent_key_images {
+        write_string(&mut buf, ki);
+    }
+    
+    // Spent outpoints
+    buf.extend_from_slice(&(data.spent_outpoints.len() as u32).to_le_bytes());
+    for op in &data.spent_outpoints {
+        write_string(&mut buf, op);
+    }
+    
+    buf
+}
+
+/// Decode [`WalletCacheData`] from binary.
+fn decode_wallet_cache(data: &[u8]) -> Result<WalletCacheData> {
+    let mut offset = 0;
+    
+    let wallet_id = read_string(data, &mut offset)?;
+    let last_processed_index = read_u64(data, &mut offset)?;
+    let ct_last_processed_index = read_u64(data, &mut offset)?;
+    let scanned_at_height = read_u64(data, &mut offset)?;
+    let ct_scanned_at_height = read_u64(data, &mut offset)?;
+    
+    // RingCT UTXOs
+    let utxo_count = read_count(data, &mut offset, "UTXO")?;
+    let mut utxos = Vec::with_capacity(utxo_count);
+    for _ in 0..utxo_count {
+        utxos.push(decode_cached_utxo(data, &mut offset)?);
+    }
+    
+    // CT UTXOs
+    let ct_utxo_count = read_count(data, &mut offset, "CT UTXO")?;
+    let mut ct_utxos = Vec::with_capacity(ct_utxo_count);
+    for _ in 0..ct_utxo_count {
+        ct_utxos.push(decode_cached_utxo_ct(data, &mut offset)?);
+    }
+    
+    // Spent key images
+    let ki_count = read_count(data, &mut offset, "spent key image")?;
+    let mut spent_key_images = Vec::with_capacity(ki_count);
+    for _ in 0..ki_count {
+        spent_key_images.push(read_string(data, &mut offset)?);
+    }
+    
+    // Spent outpoints
+    let op_count = read_count(data, &mut offset, "spent outpoint")?;
+    let mut spent_outpoints = Vec::with_capacity(op_count);
+    for _ in 0..op_count {
+        spent_outpoints.push(read_string(data, &mut offset)?);
+    }
+    
+    Ok(WalletCacheData {
+        wallet_id,
+        last_processed_index,
+        ct_last_processed_index,
+        scanned_at_height,
+        ct_scanned_at_height,
+        utxos,
+        ct_utxos,
+        spent_key_images,
+        spent_outpoints,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Framing
 // ---------------------------------------------------------------------------
 
@@ -749,18 +1193,6 @@ fn decode_envelope(bytes: &[u8]) -> std::result::Result<&[u8], CacheLoad> {
     Ok(payload)
 }
 
-/// Decode a hex string into a fixed-size array, reporting a corrupt cache.
-fn hex_array<const N: usize>(field: &str, value: &str) -> Result<[u8; N]> {
-    let bytes = hex_to_bytes(value)
-        .map_err(|e| VeilError::cache(format!("cached {field} is not valid hex: {e}")))?;
-
-    bytes.try_into().map_err(|_| {
-        VeilError::cache(format!(
-            "cached {field} has the wrong length, expected {N} bytes"
-        ))
-    })
-}
-
 // ---------------------------------------------------------------------------
 // BalanceCache
 // ---------------------------------------------------------------------------
@@ -811,7 +1243,7 @@ impl<'a> BalanceCache<'a> {
             Err(outcome) => return outcome,
         };
 
-        let data: WalletCacheData = match serde_json::from_slice(payload) {
+        let data: WalletCacheData = match decode_wallet_cache(payload) {
             Ok(data) => data,
             Err(e) => return CacheLoad::Corrupt(format!("payload did not decode: {e}")),
         };
@@ -830,7 +1262,7 @@ impl<'a> BalanceCache<'a> {
 
     /// Write `data`, replacing any existing record for its wallet.
     pub fn save(&self, data: &WalletCacheData) -> Result<()> {
-        let payload = serde_json::to_vec(data)?;
+        let payload = encode_wallet_cache(data);
         self.store
             .store(&Self::key(&data.wallet_id), &encode_envelope(&payload))?;
         self.store.flush()
@@ -843,13 +1275,160 @@ impl<'a> BalanceCache<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sent-transaction cache
+// ---------------------------------------------------------------------------
+
+/// A transaction this wallet successfully sent.
+///
+/// Recorded after `sendrawtransaction` returns, so the wallet knows which of
+/// its outputs were change rather than incoming payments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentTransaction {
+    /// Transaction ID, 32-byte hash in internal byte order.
+    pub txid: [u8; 32],
+    /// When the broadcast succeeded, as unix timestamp.
+    pub sent_at: u64,
+}
+
+impl SentTransaction {
+    /// Create a record for a transaction that was just broadcast.
+    pub fn new(txid: [u8; 32]) -> Self {
+        Self {
+            txid,
+            sent_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }
+    }
+}
+
+/// Encode a [`SentTransaction`] into binary.
+fn encode_sent_tx(tx: &SentTransaction, buf: &mut Vec<u8>) {
+    write_hash32(buf, &tx.txid);
+    buf.extend_from_slice(&tx.sent_at.to_le_bytes());
+}
+
+/// Decode a [`SentTransaction`] from binary.
+fn decode_sent_tx(data: &[u8], offset: &mut usize) -> Result<SentTransaction> {
+    let txid = read_hash32(data, offset)?;
+    let sent_at = read_u64(data, offset)?;
+    Ok(SentTransaction { txid, sent_at })
+}
+
+/// Encode a list of sent transactions.
+fn encode_sent_txs(txs: &[SentTransaction]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(txs.len() as u32).to_le_bytes());
+    for tx in txs {
+        encode_sent_tx(tx, &mut buf);
+    }
+    buf
+}
+
+/// Decode a list of sent transactions.
+fn decode_sent_txs(data: &[u8]) -> Result<Vec<SentTransaction>> {
+    let mut offset = 0;
+    let count = read_count(data, &mut offset, "sent transaction")?;
+    let mut txs = Vec::with_capacity(count);
+    for _ in 0..count {
+        txs.push(decode_sent_tx(data, &mut offset)?);
+    }
+    Ok(txs)
+}
+
+/// Records transactions this wallet successfully broadcast.
+///
+/// Used to distinguish change (outputs in a transaction the wallet sent) from
+/// incoming payments (outputs in a transaction it did not send). The two look
+/// identical in the watch-only stream, so the distinction is recovered by
+/// consulting this layer.
+pub struct SentCache<'a> {
+    store: &'a dyn CacheStore,
+}
+
+impl<'a> SentCache<'a> {
+    /// Wrap a store.
+    pub fn new(store: &'a dyn CacheStore) -> Self {
+        Self { store }
+    }
+
+    /// Storage key for a wallet's sent-transaction list.
+    fn key(wallet_id: &str) -> String {
+        format!("sent/{wallet_id}")
+    }
+
+    /// Read the sent-transaction history for `wallet_id`.
+    ///
+    /// Returns `None` when no sent-transaction cache exists yet, which means the
+    /// wallet has never recorded a broadcast. Returns `Some(vec)` when a cache
+    /// exists, even if it is empty—an empty cache means the wallet has been used
+    /// but has never sent a transaction, which is a different state that still
+    /// permits labelling UTXOs as received rather than unknown.
+    ///
+    /// A corrupt record also returns `None`: the history was lost, so the safest
+    /// fallback is treating it as never having existed, which keeps all UTXOs
+    /// labelled [`TxDirection::Unknown`] rather than incorrectly relabelling
+    /// existing change as received.
+    pub fn load(&self, wallet_id: &str) -> Option<Vec<SentTransaction>> {
+        let raw = self.store.load(&Self::key(wallet_id)).ok()??;
+        let payload = decode_envelope(&raw).ok()?;
+        decode_sent_txs(payload).ok()
+    }
+
+    /// Record that a transaction was successfully broadcast.
+    ///
+    /// Write failures are swallowed: sent-transaction history is derived
+    /// bookkeeping, so a lost write degrades to UTXOs being labelled
+    /// [`TxDirection::Unknown`] rather than stopping the broadcast.
+    pub fn record(&self, wallet_id: &str, tx: &SentTransaction) -> Result<()> {
+        let mut txs = self.load(wallet_id).unwrap_or_default();
+        
+        // Deduplicate: if a transaction was recorded once, recording it again
+        // is a no-op rather than an error.
+        if txs.iter().any(|t| t.txid == tx.txid) {
+            return Ok(());
+        }
+        
+        txs.push(tx.clone());
+        
+        let payload = encode_sent_txs(&txs);
+        self.store
+            .store(&Self::key(wallet_id), &encode_envelope(&payload))?;
+        self.store.flush()
+    }
+
+    /// Whether `txid` is in the sent-transaction history.
+    pub fn contains(&self, wallet_id: &str, txid: &[u8; 32]) -> bool {
+        self.load(wallet_id)
+            .map(|txs| txs.iter().any(|t| &t.txid == txid))
+            .unwrap_or(false)
+    }
+
+    /// Delete the sent-transaction history for `wallet_id`.
+    pub fn clear(&self, wallet_id: &str) -> Result<()> {
+        self.store.remove(&Self::key(wallet_id))?;
+        self.store.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parsed_utxo(txid: &str, vout: u32, amount: u64, key_image: u8) -> ParsedUtxo {
+    /// Expand a short label into a full 64-character txid.
+    ///
+    /// A real txid is 32 bytes, and the cache now stores it as such, so a
+    /// two-character stand-in no longer decodes. Repeating the label keeps the
+    /// tests readable while producing something the codec accepts.
+    fn txid(label: &str) -> String {
+        label.repeat(64 / label.len())
+    }
+
+    fn parsed_utxo(label: &str, vout: u32, amount: u64, key_image: u8) -> ParsedUtxo {
         ParsedUtxo {
-            txid: txid.to_string(),
+            txid: txid(label),
             vout,
             amount,
             commitment: [0x08u8; 33],
@@ -861,12 +1440,30 @@ mod tests {
         }
     }
 
+    fn parsed_utxo_ct(label: &str, vout: u32, amount: u64, script_pubkey: Vec<u8>) -> ParsedUtxoCt {
+        ParsedUtxoCt {
+            txid: txid(label),
+            vout,
+            amount,
+            commitment: [0x08u8; 33],
+            blind: [0xABu8; 32],
+            pubkey: [0x02u8; 33],
+            ephemeral_pubkey: [0x03u8; 33],
+            script_pubkey,
+        }
+    }
+
+    /// A 32-byte txid built from a short label, for the sent-cache tests.
+    fn txid_bytes(label: &str) -> [u8; 32] {
+        parse_txid(&txid(label)).expect("test labels expand to valid hex")
+    }
+
     fn sample_data() -> WalletCacheData {
         let mut data = WalletCacheData::new("wallet-1");
         data.last_processed_index = 1_234;
         data.utxos = vec![
-            CachedUtxo::from_parsed(&parsed_utxo("aa", 0, 100, 0x01)),
-            CachedUtxo::from_parsed(&parsed_utxo("bb", 1, 250, 0x02)),
+            CachedUtxo::from_parsed(&parsed_utxo("aa", 0, 100, 0x01)).unwrap(),
+            CachedUtxo::from_parsed(&parsed_utxo("bb", 1, 250, 0x02)).unwrap(),
         ];
         data.spent_key_images = vec![bytes_to_hex(&[0x09u8; 33])];
         data
@@ -965,7 +1562,7 @@ mod tests {
 
     #[test]
     fn a_record_from_another_schema_version_reads_as_stale() {
-        let payload = serde_json::to_vec(&sample_data()).unwrap();
+        let payload = encode_wallet_cache(&sample_data());
         let mut raw = encode_envelope(&payload);
         raw[4..8].copy_from_slice(&(CACHE_SCHEMA_VERSION + 1).to_le_bytes());
 
@@ -1021,13 +1618,19 @@ mod tests {
     #[test]
     fn cached_utxos_convert_back_to_spendable_form() {
         let parsed = parsed_utxo("aa", 3, 500, 0x07);
-        let cached = CachedUtxo::from_parsed(&parsed);
+        let cached = CachedUtxo::from_parsed(&parsed).unwrap();
 
-        assert_eq!(cached.outpoint(), "aa:3");
-        assert_eq!(cached.key_image_bytes().unwrap(), [0x07u8; 33]);
-        assert_eq!(cached.to_parsed().unwrap(), parsed);
+        assert_eq!(cached.outpoint(), format!("{}:3", txid("aa")));
+        assert_eq!(cached.key_image_bytes(), [0x07u8; 33]);
+
+        // The txid survives the string-to-bytes-to-string trip unchanged, which
+        // is the property that keeps the binary representation invisible to
+        // callers.
+        assert_eq!(cached.to_parsed(), parsed);
+        assert_eq!(cached.txid_hex(), parsed.txid);
 
         let utxo = cached.to_utxo().unwrap();
+        assert_eq!(utxo.txid, parsed.txid);
         assert_eq!(utxo.amount, 500);
         assert_eq!(utxo.commitment, [0x08u8; 33]);
         assert_eq!(utxo.ringct_index, Some(3));
@@ -1035,36 +1638,132 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_utxo_with_a_bad_field_length_fails_to_convert() {
-        let mut cached = CachedUtxo::from_parsed(&parsed_utxo("aa", 0, 1, 0x01));
-        cached.commitment = bytes_to_hex(&[0x08u8; 8]);
+    fn a_txid_that_is_not_32_bytes_is_refused() {
+        // Short labels were valid stand-ins while the txid was a string. Now the
+        // cache stores 32 bytes, so a malformed id has to be rejected rather
+        // than silently padded or truncated into a different transaction.
+        let mut parsed = parsed_utxo("aa", 0, 100, 0x01);
+        parsed.txid = "abcd".to_string();
 
-        assert!(cached.to_utxo().is_err());
+        assert!(CachedUtxo::from_parsed(&parsed).is_err());
+
+        let mut parsed_ct = parsed_utxo_ct("cc", 0, 100, Vec::new());
+        parsed_ct.txid = "not hex at all".to_string();
+
+        assert!(CachedUtxoCt::from_parsed(&parsed_ct).is_err());
     }
 
-    #[test]
-    fn ct_records_round_trip_through_the_cache() {
-        let parsed = ParsedUtxoCt {
-            txid: "cc".to_string(),
-            vout: 2,
-            amount: 700,
-            commitment: [0x09u8; 33],
-            blind: [0xCDu8; 32],
-            script_pubkey: vec![0x76, 0xa9, 0x14],
-            pubkey: [0x02u8; 33],
-            ephemeral_pubkey: [0x03u8; 33],
-        };
+    // The old "a cached UTXO with a bad field length fails to convert" test is
+    // gone by construction: commitment, blind, and the keys are fixed-size
+    // arrays now, so a wrong length cannot be represented in memory at all. The
+    // check moved to decode time, where a truncated field is caught by
+    // `a_truncated_payload_is_reported_rather_than_panicking`.
 
-        let cached = CachedUtxoCt::from_parsed(&parsed);
-        assert_eq!(cached.outpoint(), "cc:2");
+    #[test]
+    fn cached_ct_utxos_also_convert_back() {
+        let parsed = parsed_utxo_ct("cc", 2, 700, vec![0x76, 0xa9, 0x14]);
+
+        let cached = CachedUtxoCt::from_parsed(&parsed).unwrap();
+        assert_eq!(cached.outpoint(), format!("{}:2", txid("cc")));
 
         let utxo = cached.to_utxo().unwrap();
+        assert_eq!(utxo.txid, parsed.txid);
         assert_eq!(utxo.amount, 700);
         assert_eq!(utxo.script_pubkey, vec![0x76, 0xa9, 0x14]);
 
         let mut data = WalletCacheData::new("wallet-ct");
         data.ct_utxos = vec![cached];
         assert_eq!(data.total_balance_ct(), 700);
+    }
+
+    #[test]
+    fn sent_transaction_history_round_trips() {
+        let store = MemoryStore::new();
+        let cache = SentCache::new(&store);
+
+        // Nothing recorded yet is None, not an empty list: the wallet cannot
+        // claim it has sent nothing, only that it does not know.
+        assert_eq!(cache.load("wallet-1"), None);
+
+        let tx1 = SentTransaction {
+            txid: txid_bytes("aa"),
+            sent_at: 1234567890,
+        };
+
+        cache.record("wallet-1", &tx1).unwrap();
+        assert_eq!(cache.load("wallet-1"), Some(vec![tx1.clone()]));
+        assert!(cache.contains("wallet-1", &txid_bytes("aa")));
+        assert!(!cache.contains("wallet-1", &txid_bytes("bb")));
+
+        let tx2 = SentTransaction {
+            txid: txid_bytes("bb"),
+            sent_at: 1234567900,
+        };
+
+        cache.record("wallet-1", &tx2).unwrap();
+        let loaded = cache.load("wallet-1").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains(&tx1));
+        assert!(loaded.contains(&tx2));
+
+        // Clearing takes the history back to "unknown", not to "sent nothing".
+        cache.clear("wallet-1").unwrap();
+        assert_eq!(cache.load("wallet-1"), None);
+    }
+
+    #[test]
+    fn an_empty_history_is_distinct_from_an_absent_one() {
+        // This is the distinction the direction labelling depends on. A wallet
+        // with a recorded but empty history has sent nothing, so its outputs
+        // were all received. A wallet with no record cannot say either way, and
+        // must stay Unknown.
+        let store = MemoryStore::new();
+        let cache = SentCache::new(&store);
+
+        assert_eq!(cache.load("wallet-1"), None);
+
+        // Write an empty history explicitly, as a wallet that has been scanned
+        // but has never spent would have.
+        let payload = encode_sent_txs(&[]);
+        store
+            .store(&SentCache::key("wallet-1"), &encode_envelope(&payload))
+            .unwrap();
+
+        assert_eq!(cache.load("wallet-1"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn recording_a_transaction_twice_is_a_no_op() {
+        let store = MemoryStore::new();
+        let cache = SentCache::new(&store);
+
+        let tx = SentTransaction {
+            txid: txid_bytes("aa"),
+            sent_at: 1234567890,
+        };
+
+        cache.record("wallet-1", &tx).unwrap();
+        cache.record("wallet-1", &tx).unwrap();
+        cache.record("wallet-1", &tx).unwrap();
+
+        let loaded = cache.load("wallet-1").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], tx);
+    }
+
+    #[test]
+    fn sent_cache_degrades_gracefully_when_corrupted() {
+        let store = MemoryStore::new();
+        let cache = SentCache::new(&store);
+
+        store
+            .store(&SentCache::key("wallet-1"), b"corrupted")
+            .unwrap();
+
+        // A damaged record returns None rather than erroring, so the balance
+        // scan continues with all UTXOs labelled Unknown.
+        assert_eq!(cache.load("wallet-1"), None);
+        assert!(!cache.contains("wallet-1", &txid_bytes("aa")));
     }
 
     #[test]
@@ -1174,7 +1873,7 @@ mod tests {
     }
 
     #[test]
-    fn the_scan_height_round_trips_and_defaults_to_zero() {
+    fn the_scan_height_round_trips() {
         let mut data = sample_data();
         data.scanned_at_height = 1_500_000;
         data.ct_scanned_at_height = 1_499_000;
@@ -1186,23 +1885,138 @@ mod tests {
         let loaded = cache.load("wallet-1").data().unwrap();
         assert_eq!(loaded.scanned_at_height, 1_500_000);
         assert_eq!(loaded.ct_scanned_at_height, 1_499_000);
+    }
 
-        // A record written before these fields existed must still decode, with
-        // a zero height so it is treated as never scanned rather than current.
-        let legacy = serde_json::json!({
-            "wallet_id": "wallet-1",
-            "last_processed_index": 10,
-            "ct_last_processed_index": 0,
-            "utxos": [],
-            "ct_utxos": [],
-            "spent_key_images": [],
-            "spent_outpoints": [],
-        });
+    #[test]
+    fn every_field_survives_the_binary_codec() {
+        // A record with all fields populated, including the ones an empty
+        // sample would leave at their defaults, so a codec that silently drops
+        // a field is caught rather than passing by coincidence.
+        let mut data = WalletCacheData::new("wallet-full");
+        data.last_processed_index = u64::MAX - 3;
+        data.ct_last_processed_index = 987_654;
+        data.scanned_at_height = 1_234_567;
+        data.ct_scanned_at_height = 1_234_000;
 
-        let decoded: WalletCacheData = serde_json::from_value(legacy).unwrap();
-        assert_eq!(decoded.scanned_at_height, 0);
-        assert_eq!(decoded.ct_scanned_at_height, 0);
-        assert_eq!(decoded.last_processed_index, 10);
+        data.utxos = vec![
+            CachedUtxo::from_parsed_with_direction(
+                &parsed_utxo("aa", 0, 100, 0x01),
+                TxDirection::Send,
+            )
+            .unwrap(),
+            CachedUtxo::from_parsed_with_direction(
+                &parsed_utxo("bb", u32::MAX, u64::MAX, 0x02),
+                TxDirection::Receive,
+            )
+            .unwrap(),
+            // A UTXO with no global index, which is the None branch of the
+            // option encoding.
+            {
+                let mut parsed = parsed_utxo("cc", 7, 42, 0x03);
+                parsed.ringct_index = None;
+                CachedUtxo::from_parsed(&parsed).unwrap()
+            },
+        ];
+
+        data.ct_utxos = vec![
+            CachedUtxoCt::from_parsed_with_direction(
+                &parsed_utxo_ct("dd", 1, 700, vec![0x76, 0xa9, 0x14]),
+                TxDirection::Send,
+            )
+            .unwrap(),
+            // An empty script, which is the zero-length branch of write_bytes.
+            CachedUtxoCt::from_parsed(&parsed_utxo_ct("ee", 2, 800, Vec::new())).unwrap(),
+        ];
+
+        data.spent_key_images = vec![bytes_to_hex(&[0x09u8; 33]), bytes_to_hex(&[0x0Au8; 33])];
+        data.spent_outpoints = vec!["ff:0".to_string(), "ff:1".to_string()];
+
+        let store = MemoryStore::new();
+        let cache = BalanceCache::new(&store);
+        cache.save(&data).unwrap();
+
+        assert_eq!(cache.load("wallet-full").data().unwrap(), data);
+    }
+
+    #[test]
+    fn binary_records_are_smaller_than_their_hex_equivalent() {
+        // The point of the codec is size. A cached UTXO holds 164 bytes of
+        // fixed-length keys and commitments; as hex those alone cost 328
+        // characters before quoting or field names.
+        let data = sample_data();
+        let payload = encode_wallet_cache(&data);
+
+        let hex_bytes_per_utxo = (33 + 32 + 33 + 33 + 33) * 2;
+        let hex_floor = data.utxos.len() * hex_bytes_per_utxo;
+
+        assert!(
+            payload.len() < hex_floor,
+            "binary payload of {} bytes should beat the {hex_floor}-byte hex floor",
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn a_truncated_payload_is_reported_rather_than_panicking() {
+        // Every decode path is bounds-checked, so a payload cut at any offset
+        // must come back as an error. A panic here would take down a caller
+        // that only wanted a balance.
+        let payload = encode_wallet_cache(&sample_data());
+
+        for cut in 0..payload.len() {
+            let result = decode_wallet_cache(&payload[..cut]);
+            assert!(
+                result.is_err(),
+                "a payload truncated to {cut} of {} bytes decoded anyway",
+                payload.len()
+            );
+        }
+
+        // The intact payload still decodes, so the loop above was not passing
+        // because the codec rejects everything.
+        assert!(decode_wallet_cache(&payload).is_ok());
+    }
+
+    #[test]
+    fn an_unrecognized_direction_byte_reads_as_unknown() {
+        // Direction is derived bookkeeping. A value this build does not know
+        // must degrade to Unknown rather than making the whole record corrupt
+        // and forcing a full rescan.
+        let mut data = WalletCacheData::new("wallet-1");
+        data.utxos = vec![CachedUtxo::from_parsed_with_direction(
+            &parsed_utxo("aa", 0, 100, 0x01),
+            TxDirection::Send,
+        )
+        .unwrap()];
+
+        // Locate the direction byte by encoding the same record twice, once per
+        // direction, and finding where the two differ. Hardcoding an offset
+        // would silently start testing the wrong byte the moment a field is
+        // added ahead of it.
+        let mut receive = data.clone();
+        receive.utxos[0].direction = TxDirection::Receive;
+
+        let sent_payload = encode_wallet_cache(&data);
+        let receive_payload = encode_wallet_cache(&receive);
+
+        let differing: Vec<usize> = sent_payload
+            .iter()
+            .zip(receive_payload.iter())
+            .enumerate()
+            .filter_map(|(i, (a, b))| (a != b).then_some(i))
+            .collect();
+
+        assert_eq!(
+            differing.len(),
+            1,
+            "direction should occupy exactly one byte, found {differing:?}"
+        );
+
+        let mut payload = sent_payload;
+        payload[differing[0]] = 0x7F;
+
+        let decoded = decode_wallet_cache(&payload).unwrap();
+        assert_eq!(decoded.utxos[0].direction, TxDirection::Unknown);
     }
 
     #[test]

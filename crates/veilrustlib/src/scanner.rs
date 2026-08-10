@@ -240,6 +240,9 @@ pub fn scanned_output_to_utxo(
         block_height,
         spendable: true,
         ringct_index: None,
+        // A block scan sees outputs, not the wallet's own send history, so the
+        // origin is not determinable here.
+        direction: crate::types::TxDirection::Unknown,
     })
 }
 

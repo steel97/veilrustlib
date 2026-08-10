@@ -296,7 +296,22 @@ impl PayoutWallet {
 
         // Deliberately not retried. A failed response may be a lost reply to a
         // transaction the node already accepted, and resending would pay twice.
-        let txid = self.client.send_raw_transaction(&result.tx_hex).await?;
+        //
+        // Broadcast through the scanner rather than the client directly, so the
+        // txid is recorded in the sent-transaction cache. The faucet spends its
+        // own change constantly, and without that record every change output it
+        // creates reads back as `TxDirection::Unknown` on the next scan instead
+        // of as change it produced itself.
+        //
+        // A failed cache write does not fail the payout: the transaction is
+        // already irreversible by then, so the only loss is the direction label.
+        let scanner = BalanceScanner::new(&self.client)
+            .with_cache(&self.store)
+            .with_recovery(RecoveryPolicy::Rewind(REWIND_RECORDS));
+
+        let txid = scanner
+            .broadcast_and_record(&self.keys.scan_secret, &result.tx_hex)
+            .await?;
 
         Ok(PayoutOutcome::Paid {
             txid,

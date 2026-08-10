@@ -555,7 +555,24 @@ async fn run() -> Result<(), VeilError> {
     // Deliberately not retried: a "failure" may be a lost response to a
     // transaction the node already accepted, and resending risks confusion
     // about whether the spend happened. Check the txid before retrying.
-    let res = client.send_raw_transaction(&result.tx_hex).await;
+    //
+    // The plain broadcast, kept for reference:
+    //
+    // let res = client.send_raw_transaction(&result.tx_hex).await;
+    //
+    // It works, but it leaves the wallet unable to tell later what it sent. The
+    // change returning from this spend is an owned output like any other, so a
+    // future scan would report it as `TxDirection::Unknown` rather than as
+    // change. `broadcast_and_record` sends the same transaction and then records
+    // the txid the node returned in the sent-transaction cache, which is what
+    // lets that change be labelled `Send`.
+    //
+    // The recording cannot fail the broadcast: by the time it runs the
+    // transaction is already on the network, so a failed cache write only costs
+    // the direction label.
+    let res = scanner
+        .broadcast_and_record(&keys.scan_secret, &result.tx_hex)
+        .await;
 
     match res {
         Ok(txid) => {

@@ -96,6 +96,83 @@ pub enum TransactionType {
     Coinstake = 2,
 }
 
+/// Where an output came from, as far as the wallet can tell.
+///
+/// A wallet sees its own outputs but not, by itself, why they exist: the change
+/// from a payment it made and a payment it received are both just owned outputs
+/// in the watch-only record stream. The distinction is recovered by remembering
+/// which transactions the wallet itself broadcast, which is what the sent-
+/// transaction cache layer stores.
+///
+/// The default is [`Self::Unknown`], because that is the honest answer for an
+/// output decoded straight from the chain with no local history to compare it
+/// against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum TxDirection {
+    /// Nothing is known about the originating transaction.
+    ///
+    /// This is what a first-ever scan produces: the wallet has no record of
+    /// what it has sent, so it cannot tell change from an incoming payment.
+    #[default]
+    Unknown = 0,
+    /// The output arrived in a transaction the wallet did not send.
+    ///
+    /// Reported when the sent-transaction history has been established and does
+    /// not contain this output's transaction.
+    Receive = 1,
+    /// The output was created by a transaction this wallet sent.
+    ///
+    /// In practice this is change returning to the wallet.
+    Send = 2,
+}
+
+impl TxDirection {
+    /// The on-disk discriminant.
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Parse an on-disk discriminant, treating anything unrecognized as
+    /// [`Self::Unknown`].
+    ///
+    /// An unknown value is not an error: direction is derived bookkeeping, so a
+    /// record written by a build with more variants stays readable.
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Receive,
+            2 => Self::Send,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Whether this output is change from a transaction the wallet sent.
+    pub fn is_send(self) -> bool {
+        matches!(self, Self::Send)
+    }
+
+    /// Whether this output was received from elsewhere.
+    pub fn is_receive(self) -> bool {
+        matches!(self, Self::Receive)
+    }
+
+    /// Whether the origin is still undetermined.
+    pub fn is_unknown(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
+impl std::fmt::Display for TxDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Unknown => "unknown",
+            Self::Receive => "receive",
+            Self::Send => "send",
+        };
+        f.write_str(name)
+    }
+}
+
 /// An unspent RingCT output owned by the wallet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Utxo {
@@ -119,6 +196,11 @@ pub struct Utxo {
     pub spendable: bool,
     /// Global RingCT output index, required to build a ring.
     pub ringct_index: Option<u64>,
+    /// Whether this output came from a transaction the wallet sent.
+    ///
+    /// [`TxDirection::Unknown`] until the wallet's sent-transaction history is
+    /// known; see [`TxDirection`].
+    pub direction: TxDirection,
 }
 
 /// An unspent CT output owned by the wallet.
@@ -147,6 +229,8 @@ pub struct UtxoCt {
     pub block_height: u32,
     /// Whether this output is currently spendable.
     pub spendable: bool,
+    /// Whether this output came from a transaction the wallet sent.
+    pub direction: TxDirection,
 }
 
 /// A witness stack: a list of variable-length byte pushes.
