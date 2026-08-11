@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Default public endpoint, matching the TypeScript default.
-pub const DEFAULT_NODE_URL: &str = "https://api.veil.zelcore.io";
+pub const DEFAULT_NODE_URL: &str = "https://explorer-api.veil-project.com"; // also can be used: https://api.veil.zelcore.io
 
 /// Default request timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
