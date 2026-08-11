@@ -1,1 +1,0 @@
-cargo build -p veilrustlib-examples --bin veilfaucet --release --target x86_64-unknown-linux-gnu

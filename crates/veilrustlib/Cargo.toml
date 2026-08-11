@@ -1,6 +1,6 @@
 [package]
 name = "veilrustlib"
-description = "Rust library for Veil blockchain - transaction builder, wallet management, and RPC client"
+description = "Rust library for Veil blockchain - lightwallet transaction builder, wallet management, and RPC client"
 keywords = ["veil", "blockchain", "ringct", "privacy", "stealth-addresses"]
 categories = ["cryptography::cryptocurrencies"]
 version.workspace = true
@@ -19,8 +19,8 @@ thiserror = "1.0.69"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 reqwest = { version = "0.12.15", default-features = false, features = [
-    "json",
-    "rustls-tls",
+  "json",
+  "rustls-tls",
 ], optional = true }
 base64 = { version = "0.22.1", optional = true }
 tokio = { version = "1.44.2", features = ["time"], optional = true }
