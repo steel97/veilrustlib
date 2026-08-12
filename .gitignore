@@ -1,6 +1,7 @@
-target
-ref
-plans
+target/
+ref/
+plans/
+temp/
 run_getbalance.bat
 run_tx.bat
 run_bot.bat

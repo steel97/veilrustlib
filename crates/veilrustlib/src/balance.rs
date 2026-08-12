@@ -21,7 +21,7 @@ use crate::watch_only_tx::{
     parse_watch_only_transactions, parse_watch_only_transactions_ct, ParsedUtxo, ParsedUtxoCt,
     TransactionMetadata,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Page size the node uses for `getwatchonlytxes`.
 const PAGE_SIZE: usize = 1000;
@@ -333,11 +333,17 @@ where
             parse_watch_only_transactions(&raw, spend_secret, scan_secret, Some(&metadata));
         owned_outputs_found += parsed.len();
 
+        // Fire the callback with ALL parsed outputs before filtering, so the
+        // caller can track transaction history including spent outputs
+        if !parsed.is_empty() {
+            on_utxos(&parsed);
+        }
+
         let key_images: Vec<KeyImage> = parsed.iter().map(|u| u.key_image).collect();
         check_key_images_spent_status(client, &key_images, &mut spent_key_images, batch_size)
             .await?;
 
-        let (page_unspent, page_parsed) = filter_unspent(parsed, &spent_key_images);
+        let (page_unspent, _page_parsed) = filter_unspent(parsed, &spent_key_images);
 
         total_balance = total_balance.saturating_add(
             page_unspent
@@ -345,10 +351,6 @@ where
                 .fold(0u64, |acc, u| acc.saturating_add(u.amount)),
         );
         all_unspent.extend(page_unspent);
-
-        if !page_parsed.is_empty() {
-            on_utxos(&page_parsed);
-        }
 
         // Advance using the node's own index so no record is processed twice.
         if let Some(dbindex) = page.anon.last().and_then(|r| r.dbindex) {
@@ -436,7 +438,12 @@ where
             parse_watch_only_transactions_ct(&raw, spend_secret, scan_secret, Some(&metadata));
         owned_outputs_found += parsed.len();
 
-        let (page_unspent, page_parsed) =
+        // Fire the callback with ALL parsed outputs before filtering
+        if !parsed.is_empty() {
+            on_utxos(&parsed);
+        }
+
+        let (page_unspent, _page_parsed) =
             filter_unspent_ct(parsed, &options.known_spent_outpoints);
 
         total_balance = total_balance.saturating_add(
@@ -445,10 +452,6 @@ where
                 .fold(0u64, |acc, u| acc.saturating_add(u.amount)),
         );
         all_unspent.extend(page_unspent);
-
-        if !page_parsed.is_empty() {
-            on_utxos(&page_parsed);
-        }
 
         if let Some(dbindex) = page.stealth.last().and_then(|r| r.dbindex) {
             last_processed_index = dbindex + 1;
@@ -1034,6 +1037,16 @@ impl<'a> BalanceScanner<'a> {
         // held. The node can re-report a record, so dedupe rather than trust
         // the pagination to be exact.
         let mut seen: HashSet<String> = surviving.iter().map(|u| u.outpoint()).collect();
+
+        // Capture txids from ALL fresh outputs BEFORE the spent filter.
+        // This is the only place every txid is still visible — after retain()
+        // below, spent ones are gone and can never be recovered.
+        let mut seen_txids_map: HashMap<[u8; 32], TxDirection> =
+            data.seen_txids.iter().cloned().collect();
+        for utxo in &fresh {
+            seen_txids_map.entry(utxo.txid).or_insert(TxDirection::Unknown);
+        }
+
         for utxo in fresh {
             if seen.insert(utxo.outpoint()) {
                 surviving.push(utxo);
@@ -1044,13 +1057,27 @@ impl<'a> BalanceScanner<'a> {
         let mut hex_buf = [0u8; 66];
         surviving.retain(|u| !spent.contains(key_image_hex_in(&u.key_image, &mut hex_buf)));
 
-        // Label each output against the wallet's own send history. This is the
-        // only place the two cache layers meet: an output whose transaction the
-        // wallet broadcast is change, anything else in a wallet with a known
-        // history was received, and a wallet with no history at all stays
-        // Unknown.
+        // Label each output against the wallet's own send history.
         let sent = self.sent_txids(scan_secret);
         label_directions(&mut surviving, sent.as_ref());
+
+        // Apply direction to ALL seen txids (including spent ones) using the
+        // same sent-history logic as label_directions.  An absent sent history
+        // (None) leaves everything Unknown, matching the surviving-only path.
+        if let Some(ref sent_set) = sent {
+            for (txid, direction) in seen_txids_map.iter_mut() {
+                *direction = if sent_set.contains(txid) {
+                    TxDirection::Send
+                } else {
+                    TxDirection::Receive
+                };
+            }
+        }
+        // Surviving outputs already have the definitive label; let them win.
+        for utxo in &surviving {
+            seen_txids_map.insert(utxo.txid, utxo.direction);
+        }
+        data.seen_txids = seen_txids_map.into_iter().collect();
 
         let utxos: Vec<Utxo> = surviving
             .iter()
@@ -1255,6 +1282,16 @@ impl<'a> BalanceScanner<'a> {
         }
 
         let mut seen: HashSet<String> = surviving.iter().map(|u| u.outpoint()).collect();
+
+        // Capture txids from ALL fresh CT outputs before merging and filtering.
+        // CT outputs may be spent via known_spent_outpoints, but those spends
+        // happen at the RPC layer, so `fresh` contains every owned output.
+        let mut seen_txids_map: HashMap<[u8; 32], TxDirection> =
+            data.seen_txids.iter().cloned().collect();
+        for utxo in &fresh {
+            seen_txids_map.entry(utxo.txid).or_insert(TxDirection::Unknown);
+        }
+
         for utxo in fresh {
             if seen.insert(utxo.outpoint()) {
                 surviving.push(utxo);
@@ -1264,6 +1301,22 @@ impl<'a> BalanceScanner<'a> {
         // Label each output against the wallet's own send history.
         let sent = self.sent_txids(scan_secret);
         label_directions(&mut surviving, sent.as_ref());
+
+        // Apply direction to ALL seen txids using the same logic.
+        if let Some(ref sent_set) = sent {
+            for (txid, direction) in seen_txids_map.iter_mut() {
+                *direction = if sent_set.contains(txid) {
+                    TxDirection::Send
+                } else {
+                    TxDirection::Receive
+                };
+            }
+        }
+        // Surviving outputs have the definitive label; let them win.
+        for utxo in &surviving {
+            seen_txids_map.insert(utxo.txid, utxo.direction);
+        }
+        data.seen_txids = seen_txids_map.into_iter().collect();
 
         let utxos: Vec<UtxoCt> = surviving
             .iter()

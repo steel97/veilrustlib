@@ -1,0 +1,29 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\veilsharp\veilsharp.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+   <ItemGroup>
+    <Content Include="..\..\target\release\veilrustffi.dll" Condition="Exists('..\..\target\release\veilrustffi.dll') And ($(RuntimeIdentifier.StartsWith('win')) Or '$(RuntimeIdentifier)' == '')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>  
+    <Content Include="..\..\target\x86_64-unknown-linux-gnu\release\libveilrustffi.so" Condition="Exists('..\..\target\x86_64-unknown-linux-gnu\release\libveilrustffi.so') And ($(RuntimeIdentifier.StartsWith('linux')) Or '$(RuntimeIdentifier)' == '')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
+    <Content Include="..\..\target\aarch64-apple-darwin\release\libveilrustffi.dylib" Condition="Exists('..\..\target\aarch64-apple-darwin\release\libveilrustffi.dylib') And ($(RuntimeIdentifier.StartsWith('osx')) Or '$(RuntimeIdentifier)' == '')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>  
+  </ItemGroup>
+
+</Project>

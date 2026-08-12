@@ -87,10 +87,12 @@ use sha2::{Digest, Sha256};
 ///   reader disagree about every offset after the first txid; the bump is what
 ///   makes an older record report as [`CacheLoad::Stale`] and get rebuilt rather
 ///   than decode into plausible nonsense.
+/// - **v4**: Added `seen_txids` map to track all transactions encountered during
+///   scanning (both spent and unspent), enabling complete transaction history.
 ///
 /// Only the newest version is readable. The cache is derived data, so a version
 /// mismatch costs one rescan and nothing else.
-pub const CACHE_SCHEMA_VERSION: u32 = 3;
+pub const CACHE_SCHEMA_VERSION: u32 = 4;
 
 /// Records [`RecoveryPolicy::default`] rewinds before resuming a scan.
 ///
@@ -604,6 +606,18 @@ pub struct WalletCacheData {
     ///
     /// Hex for the same reason as [`Self::spent_key_images`].
     pub spent_outpoints: Vec<String>,
+    /// Every transaction ID encountered during scanning, mapped to its
+    /// [`TxDirection`].
+    ///
+    /// Unlike [`Self::utxos`] and [`Self::ct_utxos`], which only hold
+    /// **unspent** outputs, this map accumulates txids from every output the
+    /// scanner decoded, including those that were subsequently spent.  That
+    /// is what lets the FFI layer return a complete transaction history rather
+    /// than only the current unspent set.
+    ///
+    /// Stored as raw 32-byte hashes in display (reversed) order so they can be
+    /// hex-encoded directly on the way out.
+    pub seen_txids: Vec<([u8; 32], TxDirection)>,
 }
 
 impl WalletCacheData {
@@ -1060,6 +1074,13 @@ fn encode_wallet_cache(data: &WalletCacheData) -> Vec<u8> {
     for op in &data.spent_outpoints {
         write_string(&mut buf, op);
     }
+
+    // Seen txids with direction (v4)
+    buf.extend_from_slice(&(data.seen_txids.len() as u32).to_le_bytes());
+    for (txid, direction) in &data.seen_txids {
+        write_hash32(&mut buf, txid);
+        buf.push(direction.as_u8());
+    }
     
     buf
 }
@@ -1101,6 +1122,15 @@ fn decode_wallet_cache(data: &[u8]) -> Result<WalletCacheData> {
     for _ in 0..op_count {
         spent_outpoints.push(read_string(data, &mut offset)?);
     }
+
+    // Seen txids with direction (v4)
+    let seen_count = read_count(data, &mut offset, "seen txid")?;
+    let mut seen_txids = Vec::with_capacity(seen_count);
+    for _ in 0..seen_count {
+        let txid = read_hash32(data, &mut offset)?;
+        let direction = TxDirection::from_u8(read_u8(data, &mut offset)?);
+        seen_txids.push((txid, direction));
+    }
     
     Ok(WalletCacheData {
         wallet_id,
@@ -1112,6 +1142,7 @@ fn decode_wallet_cache(data: &[u8]) -> Result<WalletCacheData> {
         ct_utxos,
         spent_key_images,
         spent_outpoints,
+        seen_txids,
     })
 }
 

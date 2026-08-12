@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="veilsharp/veilsharp.csproj" />
+  <Project Path="veilsharptest/veilsharptest.csproj" />
+</Solution>
