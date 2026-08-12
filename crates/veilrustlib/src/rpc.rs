@@ -104,9 +104,9 @@ pub struct RpcConfig {
 impl Default for RpcConfig {
     fn default() -> Self {
         Self {
-            url: std::env::var("VEIL_NODE_URL").unwrap_or_else(|_| DEFAULT_NODE_URL.to_string()),
-            username: std::env::var("VEIL_NODE_USERNAME").ok(),
-            password: std::env::var("VEIL_NODE_PASSWORD").ok(),
+            url: DEFAULT_NODE_URL.to_string(),
+            username: None,
+            password: None,
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -448,10 +448,7 @@ mod tests {
 
     #[test]
     fn default_config_uses_the_public_endpoint() {
-        // Only meaningful when VEIL_NODE_URL is unset in the environment.
-        if std::env::var("VEIL_NODE_URL").is_err() {
-            assert_eq!(RpcConfig::default().url, DEFAULT_NODE_URL);
-        }
+        assert_eq!(RpcConfig::default().url, DEFAULT_NODE_URL);
     }
 
     #[test]
