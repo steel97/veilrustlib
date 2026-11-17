@@ -6,7 +6,10 @@ run_getbalance.bat
 run_tx.bat
 run_bot.bat
 .env
+.output
 
 *.sqlite
 *.sqlite-wal
 *.redb
+*.cfg
+faucet-discord.service

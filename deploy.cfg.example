@@ -1,0 +1,29 @@
+{
+    "usesudo": true,
+    "targets": [
+        {
+            "name": "faucet",
+            "host": "",
+            "port": 22,
+            "authentication": {
+                "password": "user:pass"
+            },
+            "packages": [
+                "faucet"
+            ]
+        }
+    ],
+    "packages": {
+        "faucet": {
+            "localDirectory": "./.output/",
+            "targetDirectory": "/home/faucet/veil-discord-faucet/",
+            "preDeployActions": [
+                "sudo service faucet-discord stop"
+            ],
+            "postDeployActions": [
+                "sudo chown -R faucet /home/veil-discord-faucet/",
+                "sudo service faucet-discord start"                
+            ]
+        }
+    }
+}
